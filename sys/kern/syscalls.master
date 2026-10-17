@@ -115,6 +115,7 @@
 ; WARNING: this functionality is deprecated.
 
 #include <sys/param.h>
+#include <sys/door_core.h>
 #include <sys/sysent.h>
 #include <sys/sysproto.h>
 %%ABI_HEADERS%%
@@ -3442,6 +3443,7 @@
 			int flags
 		);
 	}
+
 605	AUE_PDPTRACE	STD|CAPENABLED {
 		int pdptrace(
 			int req,
@@ -3449,6 +3451,18 @@
 			int lwpid,
 			_Inout_opt_ _Contains_long_ptr_ void *addr,
 			int data
+		);
+	}
+
+; long operands are normalized explicitly by freebsd32_door.
+606	AUE_NULL	STD|CAPENABLED|NOLIB {
+		int door(
+		    long op,
+		    long arg1,
+		    long arg2,
+		    long arg3,
+		    long arg4,
+		    long arg5
 		);
 	}
 

@@ -1,0 +1,660 @@
+.Dd October 12, 2026
+.Dt DOOR 3
+.Os
+.Sh NAME
+.Nm door_create ,
+.Nm door_call ,
+.Nm door_return ,
+.Nm door_revoke ,
+.Nm door_info
+.Nd create and invoke Doors IPC endpoints
+.Sh LIBRARY
+Doors Library (libdoor, -ldoor)
+.Sh SYNOPSIS
+.In door.h
+.Ft int
+.Fn door_create "door_server_procedure_t *proc" "void *cookie" "uint_t attributes"
+.Ft int
+.Fn door_call "int fd" "door_arg_t *arg"
+.Ft int
+.Fn door_oneway "int fd" "const void *data" "size_t size"
+.Ft int
+.Fn door_async_open "int request_fd" "size_t max_pending" "door_async_t **context"
+.Ft int
+.Fn door_async_reply_fd "const door_async_t *context"
+.Ft int
+.Fn door_async_submit "door_async_t *context" "const void *data" "size_t size" "door_async_completion_t *completion" "void *cookie" "uint64_t *id"
+.Pp
+.Fn door_async_cancel "door_async_t *context" "uint64_t id"
+.Ft int
+.Fn door_async_request_parse "const void *data" "size_t size" "door_async_request_t *request"
+.Ft int
+.Fn door_async_respond "int reply_fd" "const door_async_request_t *request" "int status" "const void *data" "size_t size"
+.Ft int
+.Fn door_async_close "door_async_t *context"
+.Ft int
+.Fn door_async_token "const door_async_t *context" "uint64_t *token"
+.Ft int
+.Fn door_async_server_open "size_t max_sessions" "door_async_server_t **server"
+.Ft int
+.Fn door_async_server_register "door_async_server_t *server" "uint64_t token" "int reply_fd"
+.Ft int
+.Fn door_async_server_respond "door_async_server_t *server" "const door_async_request_t *request" "int status" "const void *data" "size_t size"
+.Ft int
+.Fn door_async_server_unregister "door_async_server_t *server" "uint64_t token"
+.Ft int
+.Fn door_async_server_close "door_async_server_t *server"
+.Ft int
+.Fn door_return "char *data" "size_t size" "door_desc_t *descs" "uint_t ndescs"
+.Ft int
+.Fn door_revoke "int fd"
+.Ft int
+.Fn door_info "int fd" "door_info_t *info"
+.Ft int
+.Fn door_cred "door_cred_t *cred"
+.Ft int
+.Fn door_ucred "ucred_t **cred"
+.Ft int
+.Fn door_bind "int fd"
+.Ft int
+.Fn door_unbind "void"
+.Ft int
+.Fn door_getparam "int fd" "int parameter" "size_t *value"
+.Ft int
+.Fn door_setparam "int fd" "int parameter" "size_t value"
+.Ft int
+.Fn fattach "int fd" "const char *path"
+.Ft int
+.Fn fdetach "const char *path"
+.Sh DESCRIPTION
+The Doors API provides descriptor-capability remote procedure calls between
+processes on one FreeBSD system.
+.Fn door_create
+creates a Door owned by the calling process, records
+.Fa cookie ,
+starts the initial managed worker, and returns a Door descriptor.
+The worker invokes
+.Fa proc
+with the creation cookie, request data, and received descriptors.
+.Pp
+The callback normally completes the invocation with
+.Fn door_return
+and then returns normally.
+The reply buffers are consumed before the callback frame is released.
+.Fn door_return
+must be called only from the active server callback.
+.Pp
+.Fn door_call
+performs a synchronous invocation.
+On input,
+.Fa arg->data_ptr
+and
+.Fa arg->data_size
+describe request data;
+.Fa arg->desc_ptr
+and
+.Fa arg->desc_num
+describe request descriptors; and
+.Fa arg->rbuf
+and
+.Fa arg->rsize
+provide reply storage.
+On success, the data fields describe the reply and returned descriptor metadata
+is owned by the caller.
+If the reply does not fit in the supplied buffer, including when
+.Va rbuf
+is
+.Dv NULL
+and
+.Va rsize
+is zero, the kernel creates a page-rounded anonymous mapping, stores its base
+and length in
+.Va rbuf
+and
+.Va rsize ,
+and makes
+.Va data_ptr
+refer to that mapping.
+The caller must release a replacement mapping with
+.Xr munmap 2
+after consuming the reply.
+.Pp
+.Fn door_oneway
+submits a data-only request to a Door created with
+.Dv DOOR_ONEWAY .
+The kernel snapshots the request before returning, but callback completion may
+occur later.
+.Ss Correlated asynchronous requests
+.Fn door_async_open
+creates a private completion endpoint for an ordinary Door or a preconnected
+.Dv DOOR_ONEWAY
+endpoint.
+.Ss Kernel-routed asynchronous calls
+On an ordinary Door,
+.Fn door_async_submit
+uses
+.Dv DOOR_SC_ASYNC_CALL
+and passes the request bytes directly.
+The server uses its ordinary callback and
+.Fn door_return ;
+no token protocol or server registration is needed.
+Requests are data-only, at most 1 MiB; replies are at most 64 KiB.
+Each completion Door admits at most 256 unfinished kernel calls, including
+raw syscall submissions. This is not a per-process kernel quota.
+One terminal completion is scheduled for each accepted call; closing or
+revoking the completion endpoint can prevent userspace delivery.
+Status is zero with result bytes, or a positive errno without bytes:
+revocation gives
+.Er EBADF
+and isolated worker disappearance gives
+.Er ECONNRESET .
+The raw header carries
+.Dv DOOR_ASYNC_C_REVOKED ,
+.Dv DOOR_ASYNC_C_WORKER_EXIT ,
+or
+.Dv DOOR_ASYNC_C_CANCELLED
+as applicable.
+.Fn door_async_cancel
+uses the request and caller-owned completion capabilities to select
+.Er ECANCELED
+if cancellation wins. It does not stop an already running server callback.
+.Ss Legacy ONEWAY request protocol
+For a
+.Dv DOOR_ONEWAY
+endpoint, submit wraps bytes in a versioned request with a context token.
+The application first uses an authenticated synchronous control Door to send
+.Fn door_async_reply_fd
+and
+.Fn door_async_token
+to the peer.
+The control callback calls
+.Fn door_async_server_register
+while caller credentials are available and acknowledges registration.
+The server verifies reply ownership, parses requests with
+.Fn door_async_request_parse ,
+and replies with
+.Fn door_async_server_respond .
+The registry selects the reply capability by token and checks captured process
+and jail identity; its size is bounded by
+.Fa max_sessions .
+The low-level
+.Fn door_async_respond
+is for a dedicated authenticated connection.
+Deferred application work must copy borrowed request bytes before callback
+return; the parsed request retains only identity and credential metadata.
+This legacy protocol supplies neither timeout nor remote cancellation;
+.Fn door_async_cancel
+returns
+.Er ENOTSUP .
+.Fn door_async_server_unregister
+closes the registered capability. Arrange authenticated teardown and drain
+request callbacks before
+.Fn door_async_server_close .
+.Ss Completion and context lifetime
+Both modes return
+.Er EAGAIN
+at the context's
+.Fa max_pending
+limit or the additional process-wide libdoor limit of 4096 pending requests.
+Kernel admission limits are separate.
+Received completions run on private reply workers; stale/duplicate replies
+are ignored. Bytes passed to a completion callback are borrowed only for its
+invocation.
+.Fn door_async_close
+stops submissions, revokes the reply endpoint and drains its managed workers.
+It invokes remaining pending callbacks synchronously on the closing thread
+with
+.Er ECANCELED .
+Thread-affine runtimes must dispatch callbacks from either thread context.
+Close is not a barrier for callbacks running at the request peer.
+Call it outside a completion callback, after stopping other context and
+borrowed-reply-fd users. Arrange peer-death detection and retire contexts when
+the peer generation changes.
+.Ss Creation attributes
+.Bl -tag -width DOOR_NO_DEPLETION_CB
+.It Dv DOOR_PRIVATE
+Use a private worker pool.
+.It Dv DOOR_UNREF
+Deliver notification when the last client reference is released.
+.It Dv DOOR_UNREF_MULTI
+Rearm unreferenced notifications; implies
+.Dv DOOR_UNREF .
+.It Dv DOOR_REFUSE_DESC
+Reject calls containing descriptors.
+.It Dv DOOR_NO_CANCEL
+Ignore ordinary signal and explicit cancellation while still allowing revoke
+and lifecycle termination.
+.It Dv DOOR_NO_DEPLETION_CB
+Disable depletion callback behavior.
+.It Dv DOOR_ONEWAY
+Use asynchronous data-only submissions and imply descriptor refusal.
+.It Dv DOOR_NO_RETURN
+Optimize callbacks that return no data or descriptors.
+.It Dv DOOR_CROSS_JAIL
+Allow a host-owned endpoint to grant capabilities to other prisons.
+.It Dv DOOR_NO_CRED
+Do not capture client credentials; credential queries return
+.Er ENOTSUP .
+.El
+.Pp
+.Dv DOOR_PRIVCREATE
+is output-only and must not be supplied to ordinary creation.
+.Ss Descriptor transfer
+For each descriptor sent in a call or reply,
+.Va d_attributes
+must contain
+.Dv DOOR_DESCRIPTOR
+and
+.Va d_descriptor
+must name an open descriptor.
+The optional
+.Dv DOOR_RELEASE
+bit selects ownership transfer.
+.Pp
+Libdoor translates this public bit into the private kernel flag
+.Dv DOOR_DESC_F_MOVE .
+If
+.Dv DOOR_RELEASE
+is absent, the private flag word is zero and the receiver obtains an
+independent duplicate while the sender retains its descriptor.
+If it is present, the kernel consumes the sender's descriptor only when the
+complete descriptor transaction and invocation have committed successfully.
+Validation or dispatch failure leaves every source descriptor open, including
+those marked for release.
+.Pp
+For a reply MOVE, successful receiver installation commits the transfer.
+A concurrent revoke does not replace that committed result with
+.Er EBADF
+while source consumption is still pending.
+The client waits for the server to consume the source descriptor and
+acknowledge MOVE before CALL returns successfully.
+The server waits for receiver installation success or failure even if the
+endpoint was revoked after reply publication.
+.Pp
+The receiver sees
+.Dv DOOR_DESCRIPTOR ,
+not
+.Dv DOOR_RELEASE .
+Thus RELEASE is an instruction attached to the send operation, not persistent
+metadata on the received capability.
+The returned
+.Va arg->desc_ptr
+array from
+.Fn door_call
+is allocated by libdoor.
+The caller must close each received descriptor it does not retain and then
+pass the array to
+.Xr free 3 .
+.Pp
+Descriptor transfer preserves the underlying capability type and rights.
+It does not grant rights absent from a Capsicum-limited source descriptor and
+does not bypass prison or
+.Dv DOOR_CROSS_JAIL
+policy.
+.Ss Lifetime and information
+.Fn door_revoke
+revokes a Door owned by the process and wakes affected clients and workers.
+.Fn door_info
+returns its owner, callback/cookie handles for local Doors, attributes, and
+stable generation identifier.
+.Pp
+.Fn door_bind
+and
+.Fn door_unbind
+manage an explicit worker binding for the calling thread.
+.Fn door_cred
+and
+.Fn door_ucred
+return the current client's captured credentials only inside a normal callback.
+.Fn door_getparam
+and
+.Fn door_setparam
+access
+.Dv DOOR_PARAM_DESC_MAX ,
+.Dv DOOR_PARAM_DATA_MAX ,
+and
+.Dv DOOR_PARAM_DATA_MIN .
+.Ss Core function reference
+.Bl -tag -width Fn
+.It Fn door_create
+Validates the attributes, creates the endpoint, registers the callback and
+cookie, and synchronously establishes the initial managed worker.
+.It Fn door_call
+Invokes an ordinary Door and waits for completion.
+Request memory and descriptor arrays need remain valid only until return.
+.Fa arg
+may be
+.Dv NULL
+for an empty request whose result is intentionally discarded, as permitted by
+the Solaris/illumos interface.
+If the server nevertheless returns data or descriptors, libdoor releases the
+replacement mapping and closes the received descriptors before returning
+success.
+On success reply data occupies
+.Va rbuf
+and returned descriptors occupy a separately allocated array.
+If the reply exceeds
+.Va rsize ,
+the original buffer is left unchanged and a sufficiently large anonymous
+mapping is returned through
+.Va rbuf
+and
+.Va rsize .
+The callback is executed exactly once; replacement-buffer allocation never
+replays the RPC.
+On failure, libdoor leaves the visible request fields unchanged.
+The server may already have performed its operation and MOVE may have
+committed before a later library allocation failure; retry can repeat effects.
+.It Fn door_oneway
+Submits one data-only request to a
+.Dv DOOR_ONEWAY
+endpoint.
+Success means that the kernel snapshotted and accepted the bytes, not that the
+server callback has completed.
+.It Fn door_return
+Completes the callback currently executing on the calling worker.
+Reply objects are consumed synchronously before return.
+After success the callback must return normally and must not return a second
+time for that invocation.
+.It Fn door_revoke
+Prevents new calls and wakes affected clients and workers.
+Previously issued descriptors remain descriptors but operations through them
+observe revocation.
+.It Fn door_info
+Fills
+.Vt door_info_t .
+With
+.Dv DOOR_QUERY
+it reports the current worker binding.
+Procedure and cookie handles are meaningful as process-local pointers only
+when
+.Dv DOOR_LOCAL
+is set.
+.It Fn door_cred , Fn door_ucred
+Return compact or extended credentials captured for the current normal
+callback.
+The object returned by
+.Fn door_ucred
+is owned by libdoor and remains callback-local.
+.It Fn door_bind , Fn door_unbind
+Explicitly associate or disassociate the calling thread with a worker pool.
+Ordinary applications normally use workers managed by libdoor.
+.It Fn door_getparam , Fn door_setparam
+Read or change a supported per-endpoint data or descriptor limit.
+.It Fn door_server_create
+Atomically installs the legacy process-wide depletion factory and returns its
+predecessor.
+.It Fn door_xcreate
+Creates a private endpoint with application-provided worker construction.
+Every created thread must execute the supplied start entry point exactly once.
+.El
+.Ss Pathname publication
+.Fn fattach
+publishes a live Door at an existing regular-file pathname using
+.Xr namefs 4 .
+Repeating it on the same publication rebinds new opens to a new generation.
+.Fn fdetach
+removes the exact namefs mount while preserving already-open capabilities.
+.Ss Persistent shared memory
+.Ft int
+.Fn door_shm_create "int fd" "size_t size" "uint_t flags" "door_shm_t *shm"
+.Ft int
+.Fn door_shm_attach "int fd" "door_shm_id_t region" "uint_t flags" "door_shm_t *shm"
+.Ft int
+.Fn door_shm_unmap "door_shm_t *shm"
+.Ft int
+.Fn door_shm_destroy "int fd" "door_shm_id_t region"
+.Ft int
+.Fn door_shm_ref_init "const door_shm_t *shm" "size_t offset" "size_t size" "door_shm_ref_t *ref"
+.Ft int
+.Fn door_call_shm "int fd" "const door_shm_ref_t *ref"
+.Ft int
+.Fn door_call_shm_region "const door_shm_t *shm" "size_t offset" "size_t size"
+.Ft int
+.Fn door_shm_destroy_handle "door_shm_t *shm"
+.Pp
+.Fn door_shm_create
+creates and maps a generation-owned persistent region.
+.Fn door_shm_attach
+maps it into the owner/server process.
+The exact requested size is authoritative even though VM mappings are rounded
+to pages.
+.Dv DOOR_SHM_CONSUMER_RO
+permanently restricts the consumer mapping to read-only access.
+.Pp
+.Fn door_shm_ref_init
+constructs a generation-qualified, bounds-checked reference.
+.Fn door_call_shm
+invokes the Door using that region, offset, and length without copying the
+payload through the call ABI.
+Destroying a handle invalidates future references but does not implicitly
+unmap existing mappings.
+.Fn door_shm_unmap
+removes only the local mapping and closes libdoor's private descriptor which
+pins the Door generation.
+.Fn door_shm_destroy_handle
+destroys through the strong handle and invalidates its region id on success.
+Its mapping, size and private fd remain until
+.Fn door_shm_unmap .
+.Fn door_call_shm_region
+combines bounds-checked reference construction and invocation.
+All ranges are checked against the exact logical size, not merely the
+page-rounded VM mapping.
+.Ss Page-composite SHM views
+.Ft int
+.Fn door_shm_view_publish "int fd" "const door_shm_ref_t *segments" "uint_t count" "door_shm_view_t *view"
+.Ft int
+.Fn door_shm_view_attach "int fd" "uint64_t id" "uint64_t token" "door_shm_view_t *view"
+.Ft int
+.Fn door_shm_view_query "door_shm_view_t *view" "uint_t *state"
+.Ft int
+.Fn door_shm_view_release "door_shm_view_t *view"
+.Ft int
+.Fn door_shm_view_destroy "door_shm_view_t *view"
+.Ft int
+.Fn door_shm_view_close "door_shm_view_t *view"
+.Pp
+Publish lends up to 64 nonoverlapping, page-aligned ranges of existing regions
+from one Door generation. Only their creator can publish, and only the Door
+owner can attach. Attach aliases the pages consecutively in segment order,
+without copying payload bytes, with read-only maximum protection.
+Overlapping active loans and source destroy return
+.Er EBUSY .
+Disjoint subranges can be lent concurrently.
+.Pp
+The producer retains its writable alias and must stop CPU/DMA writes and
+recycling until release. The consumer must stop all readers before release,
+which removes its mapping before returning source loans. Do not alter mapping
+inheritance, create extra aliases, or share a live view through vfork/RFMEM.
+The initial mapping is not inherited by normal fork.
+.Pp
+Revoke and CALL/async completion do not release an attached view.
+Release remains available after revoke through the retained descriptor.
+Late receiver exit/exec releases mappings; producer exit preserves attached
+pages until receiver release. Canceling an unattached offer uses destroy;
+destroy of a live attached offer returns
+.Er EBUSY .
+.Pp
+After release, close the consumer handle. Query the producer handle for
+.Dv DOOR_SHM_VIEW_RELEASED
+before recycling pages, and destroy it to close its descriptor and metadata.
+Each handle owns a private descriptor. Do not independently copy handles or
+pass them to
+.Fn door_shm_unmap .
+The API covers ordinary Door SHM, not device/netmap memory. Ring data must occupy
+isolated whole pages and remain reserved until view release.
+.Ss Checked SPSC ring
+.Ft int
+.Fn door_shm_ring_create "int fd" "size_t slot_size" "size_t slot_count" "door_shm_ring_t *ring"
+.Ft int
+.Fn door_shm_ring_attach "int fd" "door_shm_id_t region" "uint_t role" "door_shm_ring_t *ring"
+.Ft int
+.Fn door_shm_ring_reserve "door_shm_ring_t *ring" "door_shm_ring_writer_t *writer"
+.Ft int
+.Fn door_shm_ring_commit "door_shm_ring_t *ring" "const door_shm_ring_writer_t *writer" "size_t size" "door_shm_ref_t *ref"
+.Ft int
+.Fn door_shm_ring_abort "door_shm_ring_t *ring" "const door_shm_ring_writer_t *writer"
+.Ft int
+.Fn door_shm_ring_push "door_shm_ring_t *ring" "const void *data" "size_t size" "door_shm_ref_t *ref"
+.Ft int
+.Fn door_shm_ring_acquire "door_shm_ring_t *ring" "door_shm_ring_view_t *view"
+.Ft int
+.Fn door_shm_ring_consume "door_shm_ring_t *ring" "const door_shm_ring_view_t *view"
+.Ft int
+.Fn door_shm_ring_pop "door_shm_ring_t *ring" "void *data" "size_t capacity" "size_t *size"
+.Ft int
+.Fn door_shm_ring_unmap "door_shm_ring_t *ring"
+.Pp
+The ring is single-producer/single-consumer.
+.Fn door_shm_ring_reserve
+returns the next mutable slot;
+.Fn door_shm_ring_commit
+publishes only its committed prefix; and
+.Fn door_shm_ring_abort
+discards it.
+.Fn door_shm_ring_acquire
+returns a logical read view under the cooperating SPSC protocol, valid until
+.Fn door_shm_ring_consume .
+The copying wrappers are
+.Fn door_shm_ring_push
+and
+.Fn door_shm_ring_pop .
+Writer/view checks validate the current mapping, slot, sequence, size and
+reservation state; they do not directly compare a Door uniquifier.
+Generation-qualified
+.Vt door_shm_ref_t
+references carry strong Door identity separately.
+A writable peer can modify bytes outside the protocol; the view is not
+protected by VM immutability.
+.Pp
+Only one reservation may be outstanding on a producer handle and only one view
+on a consumer handle.
+.Fn door_shm_ring_reserve
+returns
+.Er EAGAIN
+when full and
+.Er EBUSY
+when a reservation is already outstanding.
+.Fn door_shm_ring_commit
+publishes exactly the requested prefix, never the unused tail of a reused
+slot.
+.Fn door_shm_ring_abort
+releases an unpublished reservation.
+.Fn door_shm_ring_acquire
+returns
+.Er EAGAIN
+when empty, while
+.Fn door_shm_ring_consume
+advances only for the exact unmodified view most recently acquired.
+.Fn door_shm_ring_pop
+reports the required size and leaves the item available if the destination is
+too small.
+.Fn door_shm_ring_unmap
+releases the local mapping after outstanding local state has been resolved.
+.Ss Optional named services
+.Ft int
+.Fn door_named_register "int fd" "const char *name" "uint_t flags"
+.Ft int
+.Fn door_named_unregister "int fd" "const char *name" "uint_t flags"
+.Ft int
+.Fn door_named_lookup "const char *name" "uint_t flags" "door_named_info_t *info"
+.Ft int
+.Fn door_named_connect "const char *name" "uint_t flags" "door_named_info_t *info"
+.Pp
+These functions use
+.Pa /dev/doorctl ,
+which exists only when the kernel includes
+.Cd "options DOORCTL" .
+Registration may be local to a prison or use
+.Dv DOOR_NAMED_GLOBAL .
+GLOBAL is accepted only for register/unregister. Lookup/connect require
+flags zero and select local scope before global; lookup does not reserve a
+generation for a later connect. Connect reports generation/jail identity and
+sets dni_attributes to zero; lookup returns attributes.
+Connect returns an ordinary descriptor pinned to the generation current at
+that instant.
+Unregistering a name does not invalidate capabilities already issued.
+.Ss Worker factories
+.Ft door_server_func_t *
+.Fn door_server_create "door_server_func_t *factory"
+.Ft int
+.Fn door_xcreate "door_server_procedure_t *proc" "void *cookie" "uint_t attributes" "door_xcreate_server_func_t *factory" "door_xcreate_thrsetup_func_t *setup" "void *setup_arg" "int nthreads"
+.Pp
+.Fn door_server_create
+installs the process-wide legacy depletion callback.
+.Fn door_xcreate
+creates a private Door whose worker lifecycle is supplied by the application.
+.Sh RETURN VALUES
+Functions returning
+.Vt int
+return zero on success unless documented as returning a descriptor.
+Descriptor-producing functions return a non-negative descriptor.
+On failure, -1 is returned and
+.Va errno
+is set.
+.Fn door_server_create
+returns the previous callback.
+.Sh ERRORS
+Common errors include:
+.Bl -tag -width Er
+.It Bq Er EINVAL
+An argument, flag, role, lifecycle token, or callback context is invalid.
+.It Bq Er EBADF
+The descriptor, Door, generation, or region is invalid or revoked.
+.It Bq Er EACCES
+Mode, jail or mapping policy denies the operation.
+.It Bq Er EPERM
+Ownership or publication scope denies the operation.
+.It Bq Er EFAULT
+A supplied memory range is inaccessible.
+.It Bq Er EAGAIN
+No ring slot/item is available, or an async context, process or completion
+Door admission limit is reached.
+.It Bq Er EBUSY
+A writer/view is already outstanding or another lifecycle operation conflicts.
+.It Bq Er EMSGSIZE
+A reply/receive buffer, async payload or ring-slot size is exceeded.
+An undersized ordinary CALL reply buffer is replaced automatically and is not
+by itself an
+.Er EMSGSIZE
+condition.
+.It Bq Er ENOBUFS
+A request violates the per-Door data-size limits.
+.It Bq Er ENFILE
+A request exceeds the per-Door descriptor limit.
+.It Bq Er EINTR
+A cancellable synchronous call was interrupted.
+.It Bq Er ECANCELED
+Explicit async cancellation won, or close drained a pending completion.
+.It Bq Er ECONNRESET
+The assigned worker disappeared without endpoint revocation.
+.It Bq Er ENOENT
+A named service or persistent region does not exist.
+.It Bq Er ENOTSUP
+The requested attribute combination or credential operation is unsupported,
+or descriptor transfer is forbidden by endpoint policy.
+.El
+.Sh THREAD SAFETY
+Independent Door descriptors and calls are thread-safe.
+The checked ring requires exactly one producer and one consumer; a single ring
+handle must not be used concurrently by multiple producers or consumers.
+Callback-local credential state must not be retained after the callback.
+.Sh SEE ALSO
+.Xr door 2 ,
+.Xr open 2 ,
+.Xr close 2 ,
+.Xr capsicum 4 ,
+.Xr doorfs 4 ,
+.Xr namefs 4 ,
+.Xr jail 8
+.Sh HISTORY
+The public API follows the illumos Doors programming model and adds FreeBSD
+extensions for ONEWAY calls, persistent shared memory, checked SPSC rings,
+Capsicum, jails, and the optional named registry.
+.Sh CAVEATS
+Virtual addresses in
+.Vt door_shm_t
+are process-local and must never be sent to another process.
+A writable shared region is intentionally shared state, not a mutual trust
+boundary; validate application-level message formats even though kernel range
+and generation checks succeed.

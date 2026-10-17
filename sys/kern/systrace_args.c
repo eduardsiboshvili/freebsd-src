@@ -3583,6 +3583,18 @@ systrace_args(int sysnum, void *params, uint64_t *uarg, int *n_args)
 		*n_args = 5;
 		break;
 	}
+	/* door */
+	case 606: {
+		struct door_args *p = params;
+		iarg[a++] = p->op; /* long */
+		iarg[a++] = p->arg1; /* long */
+		iarg[a++] = p->arg2; /* long */
+		iarg[a++] = p->arg3; /* long */
+		iarg[a++] = p->arg4; /* long */
+		iarg[a++] = p->arg5; /* long */
+		*n_args = 6;
+		break;
+	}
 	default:
 		*n_args = 0;
 		break;
@@ -9600,6 +9612,31 @@ systrace_entry_setargdesc(int sysnum, int ndx, char *desc, size_t descsz)
 			break;
 		};
 		break;
+	/* door */
+	case 606:
+		switch (ndx) {
+		case 0:
+			p = "long";
+			break;
+		case 1:
+			p = "long";
+			break;
+		case 2:
+			p = "long";
+			break;
+		case 3:
+			p = "long";
+			break;
+		case 4:
+			p = "long";
+			break;
+		case 5:
+			p = "long";
+			break;
+		default:
+			break;
+		};
+		break;
 	default:
 		break;
 	};
@@ -11640,6 +11677,11 @@ systrace_return_setargdesc(int sysnum, int ndx, char *desc, size_t descsz)
 		break;
 	/* pdptrace */
 	case 605:
+		if (ndx == 0 || ndx == 1)
+			p = "int";
+		break;
+	/* door */
+	case 606:
 		if (ndx == 0 || ndx == 1)
 			p = "int";
 		break;

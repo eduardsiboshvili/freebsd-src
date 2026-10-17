@@ -35,6 +35,7 @@
  */
 
 #include "opt_ddb.h"
+#include "opt_doorfs.h"
 #include "opt_ktrace.h"
 
 #define EXTERR_CATEGORY	EXTERR_CAT_PROCEXIT
@@ -68,6 +69,9 @@
 #include <sys/syslog.h>
 #include <sys/sysproto.h>
 #include <sys/timers.h>
+#ifdef DOORFS
+#include <sys/door_impl.h>
+#endif
 #include <sys/tty.h>
 #include <sys/umtxvar.h>
 #include <sys/vmmeter.h>
@@ -303,6 +307,20 @@ exit1(struct thread *td, int rval, int signo)
 	 */
 	PROC_LOCK(p);
 	proc_set_p2_wexit(p);
+
+#ifdef DOORFS
+	/*
+	 * Door server threads can wait indefinitely in door_return(2).  Revoke
+	 * the process-owned endpoints before thread_single() waits for those
+	 * threads to leave the kernel.  P2_WEXIT is published first so that a
+	 * concurrent door_create(2) cannot publish a new endpoint after this
+	 * pass.  door_process_exit() acquires Door and scheduler locks and must
+	 * therefore run without the process lock held.
+	 */
+	PROC_UNLOCK(p);
+	door_process_exit(p);
+	PROC_LOCK(p);
+#endif
 
 	/*
 	 * First check if some other thread or external request got

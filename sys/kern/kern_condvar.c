@@ -28,6 +28,7 @@
 
 #include <sys/cdefs.h>
 #include "opt_ktrace.h"
+#include "opt_doorfs.h"
 
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -40,6 +41,9 @@
 #include <sys/ktrace.h>
 #include <sys/condvar.h>
 #include <sys/sched.h>
+#ifdef DOORFS_TEST
+#include <sys/door_test.h>
+#endif
 #include <sys/signalvar.h>
 #include <sys/sleepqueue.h>
 #include <sys/resourcevar.h>
@@ -342,6 +346,222 @@ _cv_wait_sig_unlock(struct cv *cvp, struct lock_object *lock)
 	return (rval);
 }
 
+
+#ifdef DOORFS
+/*
+ * Noninterruptible private waits publish scheduler intent without a sleepqueue.
+ * The generic branch retains the normal CV/signal interlock for other waits.
+ */
+static int
+_cv_wait_shuttle_common(struct cv *cvp, struct lock_object *lock,
+    struct thread *peer, struct thread *dispatch_td, struct cv *dispatch_cvp,
+    int shuttle_flags, int interruptible)
+{
+	WITNESS_SAVE_DECL(lock_witness);
+#ifdef KTRACE
+	char wmesg[WMESGLEN + 1];
+#endif
+	struct lock_class *class;
+	struct thread *td __ktrace_used;
+	enum sched_shuttle_result prep, park, dispatch, wake, sw __diagused;
+	uintptr_t lock_state;
+	int rval, sqflags;
+	bool dispatch_done, idle_wait;
+
+	td = curthread;
+	CV_ASSERT(cvp, lock, td);
+	WITNESS_WARN(WARN_GIANTOK | WARN_SLEEPOK, lock,
+	    "Waiting on \"%s\"", cvp->cv_description);
+
+	if (SCHEDULER_STOPPED())
+		return (0);
+
+#ifdef KTRACE
+	if (KTRPOINT(td, KTR_CSW)) {
+		strlcpy(wmesg, cv_wmesg(cvp), sizeof(wmesg));
+		ktrcsw(1, 0, wmesg);
+	} else {
+		wmesg[0] = '\0';
+	}
+#endif
+
+	class = LOCK_CLASS(lock);
+	lock_state = 0;
+	dispatch_done = false;
+	idle_wait =
+	    (shuttle_flags & SCHED_SHUTTLE_F_IDLE_WAIT) != 0;
+
+	/*
+	 * Publish PREPARED while the external interlock is held; resume may latch an
+	 * early wake. Drop the interlock before swtch commits/parks, so turnstiles
+	 * never see a sleeping owner of an unrelated mutex.
+	 */
+	if (!interruptible && ((peer != NULL && peer != td) ||
+	    (peer == NULL && idle_wait)) &&
+	    lock != &Giant.lock_object &&
+	    (class->lc_flags & LC_SLEEPABLE) == 0) {
+		thread_lock(td);
+		park = sched_shuttle_sleep(td, peer, cvp, shuttle_flags);
+		thread_unlock(td);
+		if (park == SCHED_SHUTTLE_OK) {
+			/*
+			 * An initial Door CALL may already have selected one exact
+			 * idle worker.  Reserve/wake it before dropping the Door
+			 * mutex, as illumos shuttle_resume() selects the successor
+			 * before releasing its interlock.
+			 */
+			if (dispatch_td != NULL && dispatch_cvp != NULL) {
+				dispatch = sched_shuttle_resume_to(dispatch_td, td,
+				    SCHED_SHUTTLE_F_DISPATCH);
+				if (dispatch != SCHED_SHUTTLE_OK) {
+					/*
+					 * A private waiter is not on dispatch_cvp's
+					 * sleepqueue, so cv_signal() alone can lose the wake.
+					 * This is especially visible when client and worker
+					 * share one CPU and the direct reservation misses.
+					 *
+					 * First use the generic shuttle resume.  It knows how
+					 * to publish TDS_SHUTTLE_WAIT through the ordinary
+					 * scheduler (including a remote CPU/IPI).  Only a
+					 * genuine CV sleeper needs cv_signal().
+					 */
+					wake = sched_shuttle_resume(dispatch_td,
+					    SCHED_SHUTTLE_F_DISPATCH);
+					if (wake != SCHED_SHUTTLE_OK &&
+					    wake != SCHED_SHUTTLE_RETRY)
+						cv_signal(dispatch_cvp);
+				}
+				dispatch_done = true;
+			}
+
+			DROP_GIANT();
+			WITNESS_SAVE(lock, lock_witness);
+			lock_state = class->lc_unlock(lock);
+
+#ifdef DOORFS_TEST
+			door_test_gate(DOOR_TEST_CV_PREPARK);
+#endif
+			/* swtch commits PREPARED; early wake returns ABORTED with lock held. */
+			thread_lock(td);
+			sw = sched_shuttle_swtch(td, shuttle_flags);
+			if (sw != SCHED_SHUTTLE_OK)
+				thread_unlock(td);
+			KASSERT(sw == SCHED_SHUTTLE_OK || sw == SCHED_SHUTTLE_ABORTED,
+			    ("shuttle switch failed: %d", sw));
+			thread_lock(td);
+			rval = 0;
+			td->td_intrval = 0;
+			td->td_flags &= ~TDF_SINTR;
+			thread_unlock(td);
+
+#ifdef KTRACE
+			if (KTRPOINT(td, KTR_CSW))
+				ktrcsw(0, 0, wmesg);
+#endif
+			PICKUP_GIANT();
+			class->lc_lock(lock, lock_state);
+			WITNESS_RESTORE(lock, lock_witness);
+			return (rval);
+		}
+	}
+
+	/*
+	 * Generic correctness fallback for unsupported scheduler/lock cases or
+	 * failed exact preparation.
+	 */
+	sleepq_lock(cvp);
+
+	CV_WAITERS_INC(cvp);
+	if (lock == &Giant.lock_object)
+		mtx_assert(&Giant, MA_OWNED);
+	DROP_GIANT();
+
+	sqflags = SLEEPQ_CONDVAR;
+	if (interruptible)
+		sqflags |= SLEEPQ_INTERRUPTIBLE;
+	sleepq_add(cvp, lock, cvp->cv_description, sqflags, 0);
+
+	thread_lock(td);
+	prep = sched_shuttle_prepare(td, peer, cvp, shuttle_flags);
+	thread_unlock(td);
+
+	if (!dispatch_done && dispatch_td != NULL && dispatch_cvp != NULL) {
+		sleepq_release(cvp);
+
+		if (prep == SCHED_SHUTTLE_OK)
+			dispatch = sched_shuttle_dispatch(dispatch_td, td,
+			    dispatch_cvp, SCHED_SHUTTLE_F_DISPATCH);
+		else
+			dispatch = SCHED_SHUTTLE_FALLBACK;
+
+		if (dispatch != SCHED_SHUTTLE_OK) {
+			/*
+			 * dispatch_td may itself be a private Door waiter and
+			 * therefore absent from dispatch_cvp's sleepqueue.  Affinity,
+			 * rtprio, or a remote CPU can reject direct dispatch without
+			 * invalidating that private wait.  Publish it through the
+			 * ordinary scheduler before falling back to cv_signal().
+			 */
+			wake = sched_shuttle_resume(dispatch_td,
+			    SCHED_SHUTTLE_F_DISPATCH);
+			if (wake != SCHED_SHUTTLE_OK &&
+			    wake != SCHED_SHUTTLE_RETRY)
+				cv_signal(dispatch_cvp);
+		}
+
+		sleepq_lock(cvp);
+	}
+
+	if (lock != &Giant.lock_object) {
+		if (class->lc_flags & LC_SLEEPABLE)
+			sleepq_release(cvp);
+		WITNESS_SAVE(lock, lock_witness);
+		lock_state = class->lc_unlock(lock);
+		if (class->lc_flags & LC_SLEEPABLE)
+			sleepq_lock(cvp);
+	}
+
+	if (interruptible)
+		rval = sleepq_wait_sig(cvp, 0);
+	else {
+		sleepq_wait(cvp, 0);
+		rval = 0;
+	}
+
+#ifdef KTRACE
+	if (KTRPOINT(td, KTR_CSW))
+		ktrcsw(0, 0, wmesg);
+#endif
+	PICKUP_GIANT();
+
+	if (lock != &Giant.lock_object) {
+		class->lc_lock(lock, lock_state);
+		WITNESS_RESTORE(lock, lock_witness);
+	}
+
+	return (rval);
+}
+
+int
+_cv_wait_shuttle(struct cv *cvp, struct lock_object *lock,
+    struct thread *peer, struct thread *dispatch_td, struct cv *dispatch_cvp,
+    int shuttle_flags)
+{
+
+	return (_cv_wait_shuttle_common(cvp, lock, peer, dispatch_td,
+	    dispatch_cvp, shuttle_flags, 0));
+}
+
+int
+_cv_wait_sig_shuttle(struct cv *cvp, struct lock_object *lock,
+    struct thread *peer, struct thread *dispatch_td, struct cv *dispatch_cvp,
+    int shuttle_flags)
+{
+
+	return (_cv_wait_shuttle_common(cvp, lock, peer, dispatch_td,
+	    dispatch_cvp, shuttle_flags | SCHED_SHUTTLE_F_INTERRUPTIBLE, 1));
+}
+#endif /* DOORFS */
 /*
  * Wait on a condition variable for (at most) the value specified in sbt
  * argument. Returns 0 if the process was resumed by cv_signal or cv_broadcast,
@@ -411,7 +631,7 @@ _cv_timedwait_sbt(struct cv *cvp, struct lock_object *lock, sbintime_t sbt,
 }
 
 /*
- * Wait on a condition variable for (at most) the value specified in sbt 
+ * Wait on a condition variable for (at most) the value specified in sbt
  * argument, allowing interruption by signals.
  * Returns 0 if the thread was resumed by cv_signal or cv_broadcast,
  * EWOULDBLOCK if the timeout expires, and EINTR or ERESTART if a signal

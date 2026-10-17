@@ -36,6 +36,7 @@
 
 #include "opt_capsicum.h"
 #include "opt_ktrace.h"
+#include "opt_doorfs.h"
 
 #include <sys/param.h>
 #include <sys/capsicum.h>
@@ -2289,10 +2290,27 @@ sig_sleepq_abort(struct thread *td, int intrval)
 {
 	THREAD_LOCK_ASSERT(td, MA_OWNED);
 
-	if (intrval == 0 && (td->td_flags & TDF_SIGWAIT) == 0)
+	if (intrval == 0 && (td->td_flags & TDF_SIGWAIT) == 0) {
 		thread_unlock(td);
-	else
-		sleepq_abort(td, intrval);
+		return;
+	}
+#ifdef DOORFS
+	/*
+	 * Exact-peer waits are interruptible but are not members of a generic
+	 * sleepqueue.  Record the same wake reason as sleepq_abort(), then only
+	 * publish the target runnable.  The resumed waiter owns final cleanup of
+	 * TDF_SINTR and td_intrval.
+	 */
+	if (TD_IS_SHUTTLE_WAIT(td)) {
+		KASSERT((td->td_flags & TDF_SINTR) != 0,
+		    ("interrupting non-interruptible shuttle wait td %p", td));
+		td->td_intrval = intrval;
+		sched_shuttle_unpark(td, 0);
+		return;
+	}
+#endif
+
+	sleepq_abort(td, intrval);
 }
 
 int
@@ -2602,7 +2620,12 @@ tdsigwakeup(struct thread *td, int sig, sig_t action, int intrval)
 	if (action == SIG_DFL && (prop & SIGPROP_KILL) != 0 &&
 	    td->td_priority > PUSER && !TD_IS_IDLETHREAD(td))
 		sched_prio(td, PUSER);
-	if (TD_ON_SLEEPQ(td)) {
+
+	if (TD_ON_SLEEPQ(td)
+#ifdef DOORFS
+    || TD_IS_SHUTTLE_WAIT(td)
+#endif
+    ) {
 		/*
 		 * If thread is sleeping uninterruptibly
 		 * we can't interrupt the sleep... the signal will
@@ -2646,6 +2669,20 @@ tdsigwakeup(struct thread *td, int sig, sig_t action, int intrval)
 		PROC_SUNLOCK(p);
 		return;
 	}
+
+#ifdef DOORFS
+	/*
+	 * TDS_SHUTTLE is neither sleeping nor on a scheduler runq.  A signal
+	 * that reaches tdsigwakeup() must take precedence over the speculative
+	 * reservation.  Exact-peer TDS_SHUTTLE_WAIT was handled above together
+	 * with ordinary interruptible sleepers.
+	 */
+	if (TD_IS_SHUTTLE(td)) {
+		setrunnable(td, 0);
+		PROC_SUNLOCK(p);
+		return;
+	}
+#endif
 
 	/*
 	 * Other states do nothing with the signal immediately,
@@ -2846,6 +2883,26 @@ sig_suspend_threads(struct thread *td, struct proc *p)
 				thread_suspend_one(td2);
 				res = true;
 			}
+#ifdef DOORFS
+		} else if (TD_IS_SHUTTLE_WAIT(td2) &&
+		    (td2->td_flags & TDF_SINTR) != 0) {
+			/*
+			 * A sleepqueue-free exact-peer waiter cannot process the
+			 * TDA_SUSPEND AST while it remains parked.  Do not convert
+			 * it directly to TDI_SUSPENDED here: doing so would destroy
+			 * the scheduler-private park state while a reply may still
+			 * race with us.
+			 *
+			 * Instead publish it runnable.  The waiter owns park
+			 * completion.  The subsystem that owns the wait is then
+			 * responsible for running the normal signal/suspend checks
+			 * before it blocks again.
+			 *
+			 * sched_shuttle_unpark() consumes td2's thread lock.
+			 */
+			sched_shuttle_unpark(td2, 0);
+			continue;
+#endif
 		} else if (!TD_IS_SUSPENDED(td2)) {
 #ifdef SMP
 			if (TD_IS_RUNNING(td2) && td2 != td)

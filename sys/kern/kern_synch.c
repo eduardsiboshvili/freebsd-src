@@ -37,6 +37,7 @@
 #include <sys/cdefs.h>
 #include "opt_ktrace.h"
 #include "opt_sched.h"
+#include "opt_doorfs.h"
 
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -463,20 +464,19 @@ kdb_switch(void)
  *
  * The thread lock is required on entry and is no longer held on return.
  */
-void
-mi_switch(int flags)
+static void
+mi_switch_common(int flags, bool direct_shuttle)
 {
 	uint64_t runtime, new_switchtime;
 	struct thread *td;
 
-	td = curthread;			/* XXX */
+	td = curthread;
 	THREAD_LOCK_ASSERT(td, MA_OWNED | MA_NOTRECURSED);
 	KASSERT(!TD_ON_RUNQ(td), ("mi_switch: called by old code"));
 #ifdef INVARIANTS
 	if (!TD_ON_LOCK(td) && !TD_IS_RUNNING(td))
 		mtx_assert(&Giant, MA_NOTOWNED);
 #endif
-	/* thread_lock() performs spinlock_enter(). */
 	KASSERT(td->td_critnest == 1 || KERNEL_PANICKED(),
 	    ("mi_switch: switch in a critical section"));
 	KASSERT((flags & (SW_INVOL | SW_VOL)) != 0,
@@ -486,13 +486,11 @@ mi_switch(int flags)
 	KASSERT((flags & SW_TYPE_MASK) < SWT_COUNT,
 	    ("mi_switch: invalid switch reason %d", (flags & SW_TYPE_MASK)));
 
-	/*
-	 * Don't perform context switches from the debugger.
-	 */
 	if (kdb_active)
 		kdb_switch();
 	if (SCHEDULER_STOPPED())
 		return;
+
 	if (flags & SW_VOL) {
 		td->td_ru.ru_nvcsw++;
 		td->td_swvoltick = ticks;
@@ -503,18 +501,16 @@ mi_switch(int flags)
 #ifdef SCHED_STATS
 	SCHED_STAT_INC(sched_switch_stats[flags & SW_TYPE_MASK]);
 #endif
-	/*
-	 * Compute the amount of time during which the current
-	 * thread was running, and add that to its total so far.
-	 */
+
 	new_switchtime = cpu_ticks();
 	runtime = new_switchtime - PCPU_GET(switchtime);
 	td->td_runtime += runtime;
 	td->td_incruntime += runtime;
 	PCPU_SET(switchtime, new_switchtime);
-	td->td_generation++;	/* bump preempt-detect counter */
+	td->td_generation++;
 	VM_CNT_INC(v_swtch);
 	PCPU_SET(switchticks, ticks);
+
 	CTR4(KTR_PROC, "mi_switch: old thread %ld (td_sched %p, pid %ld, %s)",
 	    td->td_tid, td_get_sched(td), td->td_proc->p_pid, td->td_name);
 #ifdef KDTRACE_HOOKS
@@ -523,19 +519,47 @@ mi_switch(int flags)
 	    (flags & SW_TYPE_MASK) == SWT_NEEDRESCHED)))
 		SDT_PROBE0(sched, , , preempt);
 #endif
-	sched_switch(td, flags);
+
+#ifdef DOORFS
+	if (__predict_false(direct_shuttle))
+		sched_shuttle_sswitch(td, flags);
+	else
+#endif
+		sched_switch(td, flags);
+
 	CTR4(KTR_PROC, "mi_switch: new thread %ld (td_sched %p, pid %ld, %s)",
 	    td->td_tid, td_get_sched(td), td->td_proc->p_pid, td->td_name);
 
-	/* 
-	 * If the last thread was exiting, finish cleaning it up.
-	 */
 	if ((td = PCPU_GET(deadthread))) {
 		PCPU_SET(deadthread, NULL);
 		thread_stash(td);
 	}
 	spinlock_exit();
 }
+
+void
+mi_switch(int flags)
+{
+
+	mi_switch_common(flags, false);
+}
+
+#ifdef DOORFS
+/*
+ * Dedicated MI entry for an already committed shuttle transition.
+ * Accounting is identical to mi_switch(), but the scheduler is entered
+ * through its shuttle-specific switch operation.
+ */
+void
+mi_switch_shuttle(int flags)
+{
+
+	KASSERT((flags & SW_TYPE_MASK) == SWT_SHUTTLE,
+	    ("mi_switch_shuttle: invalid switch reason %d",
+	    flags & SW_TYPE_MASK));
+	mi_switch_common(flags, true);
+}
+#endif
 
 /*
  * Change thread state to be runnable, placing it on the run queue.
@@ -563,6 +587,22 @@ setrunnable(struct thread *td, int srqflags)
 		/* unlocks thread lock according to flags */
 		sched_wakeup(td, srqflags);
 		break;
+#ifdef DOORFS
+	case TDS_SHUTTLE:
+		/*
+		 * Generic wakeups take precedence over a reserved direct handoff.
+		 */
+		sched_shuttle_cancel(td, srqflags);
+		break;
+	case TDS_SHUTTLE_WAIT:
+		/*
+		 * A parked waiter owns completion of its interruptible-wait state.
+		 * Publish it runnable without clearing TDF_SINTR, td_intrval, or the
+		 * in-flight shuttle state.
+		 */
+		sched_shuttle_unpark(td, srqflags);
+		break;
+#endif
 	default:
 		panic("setrunnable: state 0x%x", TD_GET_STATE(td));
 	}

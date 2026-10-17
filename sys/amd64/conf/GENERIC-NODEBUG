@@ -28,4 +28,6 @@
 include GENERIC
 include "std.nodebug"
 
+nooption	DOORFS_TEST
+
 ident   GENERIC-NODEBUG

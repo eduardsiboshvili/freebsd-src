@@ -8,6 +8,7 @@
  */
 
 #include "opt_sched.h"
+#include "opt_doorfs.h"
 
 #include <sys/systm.h>
 #include <sys/kernel.h>
@@ -61,6 +62,9 @@ dtrace_vtime_switch_func_t	dtrace_vtime_switch_func;
 		return (active_sched->SCHED_ITF_FIELD_NAME(fn));	\
 	}
 SCHED_ITF_DISPATCH(DEFINE_SHIM, );
+#ifdef DOORFS
+SCHED_ITF_DOOR(DEFINE_SHIM, );
+#endif
 #undef DEFINE_SHIM
 
 static char sched_name[32] = "ULE";

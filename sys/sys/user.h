@@ -104,7 +104,7 @@
 #define	LOGINCLASSLEN	17		/* size of returned ki_loginclass */
 
 #ifndef BURN_BRIDGES
-#define	OCOMMLEN	TDNAMLEN	
+#define	OCOMMLEN	TDNAMLEN
 #define	ki_ocomm	ki_tdname
 #endif
 
@@ -270,6 +270,7 @@ struct user {
 #define	KF_TYPE_INOTIFY	15
 #define	KF_TYPE_JAILDESC	16
 #define	KF_TYPE_NTSYNC	17
+#define	KF_TYPE_DOOR	18
 #define	KF_TYPE_UNKNOWN	255
 
 #define	KF_VTYPE_VNON	0

@@ -31,6 +31,7 @@
 #include "opt_witness.h"
 #include "opt_hwpmc_hooks.h"
 #include "opt_hwt_hooks.h"
+#include "opt_doorfs.h"
 
 #include <sys/systm.h>
 #include <sys/asan.h>
@@ -74,6 +75,9 @@
 #include <vm/uma.h>
 #include <vm/vm_phys.h>
 #include <sys/eventhandler.h>
+#ifdef DOORFS
+#include <sys/door_impl.h>
+#endif
 
 /*
  * Asserts below verify the stability of struct thread and struct proc
@@ -390,6 +394,7 @@ thread_ctor(void *mem, int size, void *arg, int flags)
 	td = (struct thread *)mem;
 	TD_SET_STATE(td, TDS_INACTIVE);
 	td->td_lastcpu = td->td_oncpu = NOCPU;
+	td->td_door_server = NULL;
 
 	/*
 	 * Note that td_critnest begins life as 1 because the thread is not
@@ -418,6 +423,8 @@ thread_dtor(void *mem, int size, void *arg)
 	struct thread *td;
 
 	td = (struct thread *)mem;
+
+	MPASS(td->td_door_server == NULL);
 
 #ifdef INVARIANTS
 	/* Verify that this thread is in a safe state to free. */
@@ -661,6 +668,9 @@ thread_reap_domain(struct thread_domain_data *tdd)
 
 	while (itd != NULL) {
 		ntd = itd->td_zombie;
+#ifdef DOORFS
+		door_thread_exit(itd);
+#endif
 		EVENTHANDLER_DIRECT_INVOKE(thread_dtor, itd);
 
 		tidbatch_add(&tidbatch, itd);
@@ -851,6 +861,9 @@ thread_free(struct thread *td)
 {
 	lwpid_t tid;
 
+#ifdef DOORFS
+	door_thread_exit(td);
+#endif
 	EVENTHANDLER_DIRECT_INVOKE(thread_dtor, td);
 	tid = td->td_tid;
 	thread_free_batched(td);
@@ -995,7 +1008,7 @@ thread_exit(void)
 			 */
 			panic ("thread_exit: Last thread exiting on its own");
 		}
-	} 
+	}
 #ifdef	HWPMC_HOOKS
 	/*
 	 * If this thread is part of a process that is being tracked by hwpmc(4),
@@ -1142,6 +1155,33 @@ remain_for_mode(int mode)
 	return (mode == SINGLE_ALLPROC ? 0 : 1);
 }
 
+/*
+ * Abort an interruptible wait regardless of whether it is backed by the
+ * generic sleepqueue or, when enabled, the Door shuttle private park.
+ *
+ * Private shuttle waiters deliberately are not members of a sleepqueue, so
+ * sleepq_abort() is invalid for them.  Preserve the same errno semantics by
+ * storing td_intrval and publishing the thread runnable through the shuttle
+ * unpark mechanism.  Both paths consume td's thread lock.
+ */
+static void
+thread_abort_wait(struct thread *td, int error)
+{
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+
+#ifdef DOORFS
+	if (TD_IS_SHUTTLE_WAIT(td)) {
+		KASSERT((td->td_flags & TDF_SINTR) != 0,
+		    ("aborting non-interruptible shuttle wait td %p", td));
+		td->td_intrval = error;
+		sched_shuttle_unpark(td, 0);
+		return;
+	}
+#endif
+
+	sleepq_abort(td, error);
+}
+
 static void
 weed_inhib(int mode, struct thread *td2, struct proc *p)
 {
@@ -1162,7 +1202,7 @@ restart:
 			goto restart;
 		}
 		if (TD_CAN_ABORT(td2)) {
-			sleepq_abort(td2, EINTR);
+			thread_abort_wait(td2, EINTR);
 			return;
 		}
 		break;
@@ -1175,7 +1215,7 @@ restart:
 			goto restart;
 		}
 		if (TD_CAN_ABORT(td2)) {
-			sleepq_abort(td2, ERESTART);
+			thread_abort_wait(td2, ERESTART);
 			return;
 		}
 		break;
@@ -1196,7 +1236,7 @@ restart:
 		}
 		if (TD_CAN_ABORT(td2)) {
 			td2->td_flags |= TDF_ALLPROCSUSP;
-			sleepq_abort(td2, ERESTART);
+			thread_abort_wait(td2, ERESTART);
 			return;
 		}
 		break;
@@ -1284,7 +1324,18 @@ thread_single(struct proc *p, int mode)
 				continue;
 			thread_lock(td2);
 			ast_sched_locked(td2, TDA_SUSPEND);
-			if (TD_IS_INHIBITED(td2)) {
+			if (TD_IS_INHIBITED(td2)
+#ifdef DOORFS
+				|| TD_IS_SHUTTLE_WAIT(td2)
+#endif
+			) {
+				/*
+				 * TDS_SHUTTLE_WAIT is deliberately not TDS_INHIBITED,
+				 * but an interruptible private park must participate in
+				 * thread_single() exactly like a PCATCH sleep.  weed_inhib()
+				 * uses thread_abort_wait() to select sleepq_abort() or
+				 * sched_shuttle_unpark() as appropriate.
+				 */
 				weed_inhib(mode, td2, p);
 #ifdef SMP
 			} else if (TD_IS_RUNNING(td2)) {

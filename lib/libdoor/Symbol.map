@@ -1,0 +1,72 @@
+/*-
+ * Copyright (c) 2026 Eduard Siboshvili
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+LIBDOOR_1.0 {
+    global:
+        door_create;
+        door_revoke;
+        door_info;
+        door_call;
+        door_oneway;
+        door_async_open;
+        door_async_reply_fd;
+        door_async_token;
+        door_async_submit;
+        door_async_cancel;
+        door_async_request_parse;
+        door_async_respond;
+        door_async_close;
+        door_async_server_open;
+        door_async_server_register;
+        door_async_server_respond;
+        door_async_server_unregister;
+        door_async_server_close;
+        door_shm_view_publish;
+        door_shm_view_attach;
+        door_shm_view_query;
+        door_shm_view_release;
+        door_shm_view_destroy;
+        door_shm_view_close;
+        door_shm_create;
+        door_shm_attach;
+        door_shm_unmap;
+        door_shm_destroy;
+        door_call_shm;
+        door_call_shm_region;
+        door_shm_ref_init;
+        door_shm_destroy_handle;
+        door_shm_ring_create;
+        door_shm_ring_attach;
+        door_shm_ring_abort;
+        door_shm_ring_acquire;
+        door_shm_ring_commit;
+        door_shm_ring_consume;
+        door_shm_ring_push;
+        door_shm_ring_pop;
+        door_shm_ring_reserve;
+        door_shm_ring_unmap;
+        door_return;
+        door_cred;
+        door_ucred;
+        door_bind;
+        door_unbind;
+        door_getparam;
+        door_setparam;
+        door_server_create;
+        door_xcreate;
+        fattach;
+        fdetach;
+        door_named_register;
+        door_named_unregister;
+        door_named_lookup;
+        door_named_connect;
+local:
+        *;
+};
+
+FBSDprivate_1.0 {
+    global:
+};

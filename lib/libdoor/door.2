@@ -1,0 +1,177 @@
+.Dd October 9, 2026
+.Dt DOOR 2
+.Os
+.Sh NAME
+.Nm door
+.Nd multiplexed kernel entry point for Doors IPC
+.Sh SYNOPSIS
+.In sys/types.h
+.In sys/door_core.h
+.In sys/syscall.h
+.In unistd.h
+.Ft long
+.Fn __syscall "quad_t SYS_door" "long op" "long arg1" "long arg2" "long arg3" "long arg4" "long arg5"
+.Sh DESCRIPTION
+The
+.Nm
+system call is the native kernel transport used by
+.Xr door 3 .
+It multiplexes the complete Doors ABI through the selector
+.Fa op
+and five machine-word operands.
+Applications should normally use
+.Xr door 3
+instead of issuing this system call directly.
+.Pp
+The ABI version is
+.Dv DOOR_ABI_VERSION .
+Pointer operands refer to calling-process virtual addresses.
+All public request structures contain a version field and reserved fields;
+reserved fields must be zero.
+.Pp
+The selectors are defined in
+.In sys/door_core.h :
+.Bl -tag -width DOOR_SC_SHM_DESTROY
+.It Dv DOOR_SC_CREATE
+Create a Door owned by the calling process and return its descriptor.
+.It Dv DOOR_SC_REVOKE
+Revoke an owned Door and abort pending or active operations.
+.It Dv DOOR_SC_INFO
+Return owner, generation, attributes, and queue information.
+.It Dv DOOR_SC_CALL
+Invoke according to endpoint mode (synchronous reply or ONEWAY acceptance) using
+.Vt struct door_ioc_call .
+.It Dv DOOR_SC_FAST_CALL
+Perform the scalar data-only call form.
+.It Dv DOOR_SC_EMPTY_CALL
+Perform the specialized empty request form.
+.It Dv DOOR_SC_ONEWAY
+Snapshot and submit a data-only asynchronous request.
+.It Dv DOOR_SC_RETURN
+Complete and normally receive the next invocation.
+Successful NEED_BUFS, REWAIT or EXIT outcomes contain no next request; inspect
+.Dv DOOR_RETURN_F_*
+flags before using receive outputs.
+.It Dv DOOR_SC_FAST_RETURN
+Use the scalar data-only return form.
+.It Dv DOOR_SC_EMPTY_RETURN
+Return an empty reply with the same receive outcome protocol.
+.It Dv DOOR_SC_FAST_CALL_MAPPED , Dv DOOR_SC_EMPTY_CALL_MAPPED
+Scalar calls permitting AUTO_MAP reply replacement. Decode the full packed
+result and, when present, the mapping metadata defined in
+.In sys/door_core.h ;
+the caller owns the replacement mapping.
+.It Dv DOOR_SC_ASYNC_CALL
+Submit snapshotted data with a held completion capability and reserved slot.
+The server uses normal RETURN; one terminal completion is scheduled.
+.It Dv DOOR_SC_ASYNC_CANCEL
+Cancel using request and completion capabilities. Cancellation does not stop
+an already running server callback.
+.It Dv DOOR_SC_CANCEL
+Cancel a call owned by the calling process.
+.It Dv DOOR_SC_GETPARAM , Dv DOOR_SC_SETPARAM
+Read or modify per-Door limits.
+.It Dv DOOR_SC_BIND , Dv DOOR_SC_UNBIND
+Bind or unbind the calling thread as a server worker.
+.It Dv DOOR_SC_WORKER_EXIT
+Release a worker binding during thread teardown.
+.It Dv DOOR_SC_CRED
+Obtain the captured credentials of the current invocation.
+.It Dv DOOR_SC_SHM_CREATE , Dv DOOR_SC_SHM_ATTACH
+Create or attach a persistent shared-memory region.
+.It Dv DOOR_SC_CALL_SHM
+Invoke a Door using a validated region, offset, and length tuple.
+.It Dv DOOR_SC_SHM_DESTROY
+Invalidate a persistent region handle.
+.El
+.Pp
+Descriptors are capabilities.
+Jail policy is checked when a capability is acquired. Descriptor Capsicum
+rights are checked for each operation, including CALL; per-Door limits remain
+in effect.
+A successful open or connect pins the selected Door generation; ordinary calls
+do not repeat pathname or jail lookup.
+.Pp
+The system call is present independently of
+.Cd "options DOORFS" .
+If Door support is not configured, every selector returns
+.Er ENOSYS .
+.Sh RETURN VALUES
+On success, the return value depends on the selector.
+Creation returns a descriptor; other selectors generally return zero or encode
+their documented scalar result in the return registers.
+Use the full-width
+.Fn __syscall
+result as libdoor does; scalar forms pack flags above bit 31, so truncating
+the result to int loses output information. The scalar ABI requires the
+supported machine-word width; raw callers must follow the architecture ABI.
+On failure, -1 is returned and
+.Va errno
+is set.
+.Sh ERRORS
+In addition to selector-specific errors,
+.Nm
+may return:
+.Bl -tag -width Er
+.It Bq Er EINVAL
+The selector, ABI version, flags, reserved fields, pointer/length combination,
+or current worker state is invalid.
+.It Bq Er EBADF
+A descriptor or Door generation is invalid or revoked.
+.It Bq Er EFAULT
+A supplied userspace range cannot be read or written.
+.It Bq Er EACCES
+Jail policy or mapping permissions deny capability acquisition.
+.It Bq Er ENOTCAPABLE
+The descriptor lacks the required Capsicum right.
+.It Bq Er EINTR
+A cancellable synchronous wait was interrupted.
+.It Bq Er ECANCELED
+The call was explicitly cancelled.
+.It Bq Er ECONNRESET
+An assigned worker disappeared without endpoint revocation.
+.It Bq Er EPERM
+Ownership or publication scope denies the operation.
+.It Bq Er EAGAIN
+Async context or completion admission is full.
+.It Bq Er ENOBUFS
+A request violates the per-Door data-size limits.
+.It Bq Er ENFILE
+A request exceeds the per-Door descriptor limit.
+.It Bq Er ENOTSUP
+Descriptor transfer or the requested operation is unsupported.
+.It Bq Er EMSGSIZE
+A reply/receive buffer or async payload bound is exceeded.
+.It Bq Er EBUSY
+The operation conflicts with an active worker, mapping, reservation, or vfork
+state.
+.It Bq Er ENOMEM
+Kernel memory, VM pages, mappings, or descriptor bookkeeping could not be
+allocated.
+.It Bq Er ENOSYS
+The kernel was built without
+.Cd "options DOORFS" .
+.El
+.Sh CAPABILITY MODE
+The system call is permitted in capability mode.
+Individual operations require the corresponding
+.Dv CAP_DOOR_CALL ,
+.Dv CAP_DOOR_SERVICE ,
+.Dv CAP_DOOR_ADMIN ,
+.Dv CAP_DOOR_INFO ,
+or
+.Dv CAP_DOOR_SHM
+right.
+.Sh SEE ALSO
+.Xr door 3 ,
+.Xr doorfs 4 ,
+.Xr namefs 4 ,
+.Xr capsicum 4
+.Sh HISTORY
+The
+.Nm
+system call first appeared in this FreeBSD Doors implementation with ABI 12.
+.Sh CAVEATS
+The selector ABI is intended for the libdoor library
+and may gain new selectors while retaining the existing ABI.
+Use the public library unless implementing or testing the runtime itself.

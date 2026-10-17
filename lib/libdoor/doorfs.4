@@ -1,0 +1,110 @@
+.Dd October 9, 2026
+.Dt DOORFS 4
+.Os
+.Sh NAME
+.Nm doorfs
+.Nd kernel implementation of Doors IPC
+.Sh SYNOPSIS
+.Cd "options DOORFS"
+.Cd "options DOORCTL"
+.Sh DESCRIPTION
+.Nm
+implements process-local Door creation, descriptor capabilities, synchronous
+and asynchronous invocation, server worker binding, descriptor transfer, and
+persistent shared-memory regions.
+The public interface is provided by
+.Xr door 3
+and transported through
+.Xr door 2 .
+.Pp
+Door descriptors have file type
+.Dv DTYPE_DOOR .
+They are not byte streams: ordinary read, write, truncate, polling, and vnode
+I/O operations are rejected.
+Descriptors may be duplicated, inherited, passed between processes, restricted
+with Capsicum, and published through
+.Xr namefs 4 .
+.Pp
+A descriptor pins one Door generation.
+Revocation is visible to every duplicate and aborts operations according to the
+call and cancellation policy.
+Closing one duplicate does not invalidate the others.
+Owner exit revokes owned Doors, wakes workers and clients, and removes the owner
+anchor while existing references complete their normal teardown.
+.Ss Invocation modes
+Ordinary Doors use synchronous request/reply calls.
+.Dv DOOR_ONEWAY
+snapshots the request before returning to the caller and supplies no reply.
+.Dv DOOR_NO_RETURN
+is a compatible empty-reply hint and preserves synchronous semantics.
+The current empty-reply fast path does not depend on this attribute.
+Descriptor MOVE operations are transactional and are not committed when input
+validation or dispatch fails.
+.Ss Data transfer
+Small data uses copied kernel buffers.
+Large synchronous requests and replies use held pages at direction-specific
+thresholds. Ordinary ONEWAY and kernel async request bytes are copied
+snapshots; persistent SHM is a separate shared-memory path.
+Per-Door data and descriptor limits are available through
+.Xr door_getparam 3
+and
+.Xr door_setparam 3 .
+.Ss Persistent shared memory
+Persistent SHM regions are owned by a Door generation.
+The visible size is the exact requested byte length; VM page rounding is an
+implementation detail and bytes in the rounded tail are not valid data.
+Every reference is checked for integer overflow and containment within its
+region.
+Regions belonging to different clients cannot be substituted across Door
+generations.
+.Pp
+The checked SPSC ring API stores offsets, sequence numbers, and committed
+lengths rather than process-local pointers.
+Reserve/commit and acquire/consume enforce one outstanding producer reservation
+and one outstanding consumer view per handle.
+Only the committed prefix of a reused slot is exposed.
+.Ss Jail and capability policy
+Door creation records the owner's prison.
+New capabilities may be acquired only from the same prison unless the host
+created the endpoint with
+.Dv DOOR_CROSS_JAIL .
+The flag may be used only by prison 0.
+Once acquired, a descriptor remains a capability and calls do not repeat the
+jail check.
+.Pp
+Capsicum rights separate call, service, administrative, information, and SHM
+operations.
+.Ss Optional named registry
+.Cd "options DOORCTL"
+adds
+.Pa /dev/doorctl
+and a logical named-service registry.
+It is not required for direct descriptors, the Door syscall, persistent SHM,
+or namefs publication.
+If omitted, the named functions in
+.Xr door 3
+fail when opening
+.Pa /dev/doorctl .
+.Sh SYSCTL VARIABLES
+The read-only resource ceilings are exposed below
+.Va kern.doorfs ,
+including per-process Doors, per-Door servers, SHM regions, and SHM bytes.
+When
+.Cd "options DOORCTL"
+is present, registry limits and counts are exposed below
+.Va kern.doorctl .
+.Sh SEE ALSO
+.Xr door 2 ,
+.Xr door 3 ,
+.Xr namefs 4 ,
+.Xr capsicum 4 ,
+.Xr jail 8
+.Sh HISTORY
+.Nm
+first appeared in this FreeBSD Doors implementation.
+.Sh SECURITY CONSIDERATIONS
+Shared memory is not a trust boundary between processes that are deliberately
+given access to the same writable region.
+The kernel guarantees mapping and reference boundaries, page-rounded isolation,
+generation ownership, and access permissions; applications must still define
+their own message validation and producer/consumer synchronization.

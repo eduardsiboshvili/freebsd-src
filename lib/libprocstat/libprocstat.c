@@ -411,7 +411,7 @@ getctty(kvm_t *kd, struct kinfo_proc *kp)
 	struct proc proc;
 	struct session sess;
 	int error;
-                        
+
 	assert(kp);
 	error = kvm_read_all(kd, (unsigned long)kp->ki_paddr, &proc,
 	    sizeof(proc));
@@ -629,6 +629,10 @@ procstat_getfiles_kvm(struct procstat *procstat, struct kinfo_proc *kp, int mmap
 			type = PS_FST_TYPE_INOTIFY;
 			data = file.f_data;
 			break;
+		case DTYPE_DOOR:
+			type = PS_FST_TYPE_DOOR;
+			data = file.f_data;
+			break;
 		default:
 			continue;
 		}
@@ -722,6 +726,7 @@ kinfo_type2fst(int kftype)
 		{ KF_TYPE_VNODE, PS_FST_TYPE_VNODE },
 		{ KF_TYPE_EVENTFD, PS_FST_TYPE_EVENTFD },
 		{ KF_TYPE_INOTIFY, PS_FST_TYPE_INOTIFY },
+		{ KF_TYPE_DOOR, PS_FST_TYPE_DOOR },
 		{ KF_TYPE_UNKNOWN, PS_FST_TYPE_UNKNOWN }
 	};
 #define NKFTYPES	(sizeof(kftypes2fst) / sizeof(*kftypes2fst))
@@ -1278,7 +1283,7 @@ procstat_get_vnode_info_kvm(kvm_t *kd, struct filestat *fst,
 		FSTYPE(msdosfs),
 		FSTYPE(nfs),
 		FSTYPE(smbfs),
-		FSTYPE(udf), 
+		FSTYPE(udf),
 		FSTYPE(ufs),
 #ifdef LIBPROCSTAT_ZFS
 		FSTYPE(zfs),
@@ -1351,7 +1356,7 @@ static int
 kinfo_vtype2fst(int kfvtype)
 {
 	static struct {
-		int	kf_vtype; 
+		int	kf_vtype;
 		int	fst_vtype;
 	} kfvtypes2fst[] = {
 		{ KF_VTYPE_VBAD, PS_FST_VTYPE_VBAD },
@@ -1516,7 +1521,7 @@ procstat_get_socket_info_kvm(kvm_t *kd, struct filestat *fst,
 	}
 	else
 		sock->dname[len] = '\0';
-	
+
 	/*
 	 * Fill in known data.
 	 */
@@ -1653,7 +1658,7 @@ static int
 vntype2psfsttype(int type)
 {
 	static struct {
-		int	vtype; 
+		int	vtype;
 		int	fst_vtype;
 	} vt2fst[] = {
 		{ VBAD, PS_FST_VTYPE_VBAD },

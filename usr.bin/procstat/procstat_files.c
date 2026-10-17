@@ -230,6 +230,13 @@ static struct cap_desc {
 	{ CAP_INOTIFY_ADD,	"ina" },
 	{ CAP_INOTIFY_RM,	"inr" },
 
+	/* Door IPC descriptor rights. */
+	{ CAP_DOOR_CALL,	"dc" },
+	{ CAP_DOOR_SERVICE,	"ds" },
+	{ CAP_DOOR_ADMIN,	"da" },
+	{ CAP_DOOR_INFO,	"di" },
+	{ CAP_DOOR_SHM,		"dm" },
+
 	/* Aliases and defines that combine multiple rights. */
 	{ CAP_PREAD,		"prd" },
 	{ CAP_PWRITE,		"pwr" },
@@ -425,6 +432,11 @@ procstat_files(struct procstat *procstat, struct kinfo_proc *kipp)
 			xo_emit("{eq:fd_type/inotify}");
 			break;
 
+		case PS_FST_TYPE_DOOR:
+			str = "d";
+			xo_emit("{eq:fd_type/door}");
+			break;
+
 		case PS_FST_TYPE_NONE:
 			str = "?";
 			xo_emit("{eq:fd_type/none}");
@@ -497,7 +509,7 @@ procstat_files(struct procstat *procstat, struct kinfo_proc *kipp)
 			}
 			xo_emit("{d:vnode_type/%1s/%s} ", str);
 		}
-		
+
 		xo_emit("{d:/%s}", fst->fs_fflags & PS_FST_FFLAG_READ ?
 		    "r" : "-");
 		xo_emit("{d:/%s}", fst->fs_fflags & PS_FST_FFLAG_WRITE ?
