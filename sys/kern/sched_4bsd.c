@@ -1816,6 +1816,7 @@ sched_4bsd_preempt(struct thread *td)
 {
 	int flags;
 
+	MPASS(td == curthread);
 	SDT_PROBE2(sched, , , surrender, td, td->td_proc);
 	/*
 	 * IPI_PREEMPT may interrupt a remote critical section.  Test the
