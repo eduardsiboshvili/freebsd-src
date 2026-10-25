@@ -210,6 +210,17 @@ Close is not a barrier for callbacks running at the request peer.
 Call it outside a completion callback, after stopping other context and
 borrowed-reply-fd users. Arrange peer-death detection and retire contexts when
 the peer generation changes.
+.Ss ONEWAY completion and shared storage
+An ONEWAY callback completes its server-side request with an empty RETURN.
+It has no built-in client reply transaction.
+Native async CALL uses the ordinary request callback and RETURN with an
+independently correlated completion; it is a different public operation.
+For raw public ONEWAY requests, nonempty RETURN or reply descriptors are
+rejected with EINVAL.
+Copied request storage can be reused after acceptance.
+Mutable SHM and ring storage require explicit application acknowledgement;
+a cancelled native async result alone does not prove that server readers stopped.
+A page view requires consumer release before source loans can be reused.
 .Ss Creation attributes
 .Bl -tag -width DOOR_NO_DEPLETION_CB
 .It Dv DOOR_PRIVATE

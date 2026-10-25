@@ -96,6 +96,23 @@ The system call is present independently of
 .Cd "options DOORFS" .
 If Door support is not configured, every selector returns
 .Er ENOSYS .
+.Ss ONEWAY delivery and revoke
+Successful ONEWAY submission means acceptance after copied-data capture or
+checked SHM reference acquisition, not callback completion.
+Under the Door lock the worker commits server-reference lifetime before
+unlocking for request export.
+Revoke can detach an assigned but uncommitted request; after commitment,
+RETURN or worker teardown retains cleanup responsibility even if copyout fails.
+The internal asynchronous lifetime flag is also used by native async CALL,
+which has correlated kernel completion and a separate result contract.
+.Ss Reply MOVE commit
+Successful receiver installation commits reply MOVE.
+A concurrent endpoint revoke cannot bypass installation acknowledgement or
+replace that committed transfer with EBADF while source consumption is pending.
+CALL waits until the server consumes the matching source descriptor and
+acknowledges MOVE.
+Installation failure preserves the source; a later final syscall-argument
+copyout fault remains an uncertain-result case.
 .Sh RETURN VALUES
 On success, the return value depends on the selector.
 Creation returns a descriptor; other selectors generally return zero or encode

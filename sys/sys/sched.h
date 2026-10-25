@@ -112,7 +112,6 @@ struct sched_shuttle {
 	uint32_t	 ss_flags;
 	uint8_t		 ss_state;
 	uint8_t		 ss_pending;
-	uint16_t	 ss_async_burst;
 };
 
 /*
@@ -122,8 +121,9 @@ struct sched_shuttle {
  *
  * A scheduler may return with RESERVED set and the peer temporarily removed
  * from its normal runnable representation.  MI code must treat
- * sst_sched_data and the saved run-queue fields as opaque and must either
- * commit the reservation through the scheduler switch or invoke rollback().
+ * sst_sched_data and the saved run-queue fields as opaque.  Reservation
+ * commit and restoration belong to the scheduler backend; MI code does not
+ * acquire or roll back runnable-peer reservations directly.
  * ULE retains its TDQ lock across a runnable-peer reservation; 4BSD protects
  * parked-peer reservations with its global scheduler lock.
  */
@@ -366,21 +366,11 @@ struct sched_shuttle_token {
 	    struct thread *, td, int, srqflags) \
 	FUN((__VA_ARGS__), void, shuttle_unpark, \
 	    struct thread *, td, int, srqflags) \
-	FUN((__VA_ARGS__), enum sched_shuttle_result, shuttle_park, \
-	    struct thread *, td, int, flags) \
 	FUN((__VA_ARGS__), enum sched_shuttle_result, shuttle_switch, \
 	    struct thread *, td, int, flags) \
 	FUN((__VA_ARGS__), void, shuttle_sswitch, \
 	    struct thread *, td, int, flags) \
-	FUN((__VA_ARGS__), enum sched_shuttle_result, shuttle_can_direct, \
-	    struct thread *, td, struct thread *, peer, int, flags) \
-	FUN((__VA_ARGS__), enum sched_shuttle_result, shuttle_take, \
-	    struct thread *, td, struct sched_shuttle_token *, token, int, flags) \
-	FUN((__VA_ARGS__), void, shuttle_rollback, \
-	    struct thread *, td, struct sched_shuttle_token *, token) \
 	FUN((__VA_ARGS__), void, shuttle_abort, \
-	    struct thread *, td) \
-	FUN((__VA_ARGS__), void, door_producer, \
 	    struct thread *, td)
 
 /*

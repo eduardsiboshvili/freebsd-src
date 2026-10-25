@@ -253,7 +253,7 @@ static int __read_mostly preempt_thresh = PRI_MAX_IDLE + 1;
 #else
 static int __read_mostly preempt_thresh = PRI_MIN_KERN;
 #endif
-#else
+#else 
 static int __read_mostly preempt_thresh = 0;
 #endif
 static int __read_mostly static_boost = PRI_MIN_BATCH;
@@ -273,7 +273,7 @@ static int __read_mostly sched_idlespinthresh = -1;
  * (ts) stores are serialized by the tdq mutex, loads may be lockless
  */
 struct tdq {
-	/*
+	/* 
 	 * Ordered to improve efficiency of cpu_search() and switch().
 	 * tdq_lock is padded to avoid false sharing with tdq_load and
 	 * tdq_cpu_idle.
@@ -379,7 +379,6 @@ static inline struct sched_shuttle *sched_ule_shuttle_state(struct thread *);
 static enum sched_shuttle_result sched_ule_shuttle_dispatch(struct thread *,
     struct thread *, const void *, int);
 static void sched_ule_shuttle_abort(struct thread *);
-static void sched_ule_door_producer(struct thread *);
 static enum sched_shuttle_result sched_ule_shuttle_sleep(struct thread *,
     struct thread *, const void *, int);
 static enum sched_shuttle_result sched_ule_shuttle_resume_to(struct thread *,
@@ -394,8 +393,6 @@ static enum sched_shuttle_result sched_ule_shuttle_park(struct thread *, int);
 static void sched_ule_shuttle_owner_exit(struct thread *);
 static enum sched_shuttle_result sched_ule_shuttle_take(struct thread *,
     struct sched_shuttle_token *, int);
-static void sched_ule_shuttle_rollback(struct thread *,
-    struct sched_shuttle_token *);
 static void sched_ule_shuttle_restore_locked(struct tdq *,
     struct sched_shuttle_token *);
 static struct thread *sched_ule_shuttle_commit_locked(struct tdq *,
@@ -2047,9 +2044,9 @@ sched_thread_priority(struct thread *td, u_char prio)
 		KTR_POINT3(KTR_SCHED, "thread", sched_tdname(curthread),
 		    "lend prio", "prio:%d", td->td_priority, "new prio:%d",
 		    prio, KTR_ATTR_LINKED, sched_tdname(td));
-		SDT_PROBE4(sched, , , lend__pri, td, td->td_proc, prio,
+		SDT_PROBE4(sched, , , lend__pri, td, td->td_proc, prio, 
 		    curthread);
-	}
+	} 
 	THREAD_LOCK_ASSERT(td, MA_OWNED);
 	if (td->td_priority == prio)
 		return;
@@ -2332,7 +2329,7 @@ sched_switch_migrate(struct tdq *tdq, struct thread *td, int flags)
 #ifdef SMP
 	tdq_load_rem(tdq, td);
 	/*
-	 * Do the lock dance required to avoid LOR.  We have an
+	 * Do the lock dance required to avoid LOR.  We have an 
 	 * extra spinlock nesting from sched_switch() which will
 	 * prevent preemption while we're holding neither run-queue lock.
 	 */
@@ -2363,7 +2360,7 @@ thread_unblock_switch(struct thread *td, struct mtx *mtx)
  * be assigned elsewhere via binding.
  */
 static void
-sched_ule_switch_generic(struct thread *td, int flags)
+sched_ule_switch(struct thread *td, int flags)
 {
 	struct thread *newtd;
 	struct tdq *tdq;
@@ -2372,7 +2369,9 @@ sched_ule_switch_generic(struct thread *td, int flags)
 	struct sched_shuttle_token *token;
 #endif
 	struct mtx *mtx;
+#ifdef DOORFS
 	bool shuttle_reserved;
+#endif
 	int srqflag;
 	int cpuid, preempted;
 #ifdef SMP
@@ -2383,16 +2382,15 @@ sched_ule_switch_generic(struct thread *td, int flags)
 
 	cpuid = PCPU_GET(cpuid);
 	tdq = TDQ_SELF();
-	shuttle_reserved = false;
 #ifdef DOORFS
 	token = &tdq->tdq_shuttle;
 	shuttle_reserved =
 	    (token->sst_flags & SCHED_SHUTTLE_TOKEN_RESERVED) != 0 &&
 	    token->sst_cur == td && token->sst_sched_data == tdq &&
-	    token->sst_cpu == cpuid &&
+	    token->sst_cpu == cpuid && token->sst_peer != NULL &&
+	    (TD_IS_SLEEPING(td) || TD_IS_SHUTTLE_WAIT(td)) &&
 	    ((flags & SW_TYPE_MASK) == SWT_SHUTTLE ||
-	    ((token->sst_flags & SCHED_SHUTTLE_TOKEN_WAKE_RESERVED) != 0 &&
-	    !TD_IS_RUNNING(td)));
+	    (token->sst_flags & SCHED_SHUTTLE_TOKEN_WAKE_RESERVED) != 0);
 #endif
 	ts = td_get_sched(td);
 	sched_pctcpu_update(ts, 1);
@@ -2450,8 +2448,12 @@ sched_ule_switch_generic(struct thread *td, int flags)
 		}
 		tdq_load_rem(tdq, td);
 #ifdef SMP
-		if (tdq->tdq_load == 0 && !shuttle_reserved)
-			tdq_trysteal(tdq);
+		if (tdq->tdq_load == 0) {
+#ifdef DOORFS
+			if (!shuttle_reserved)
+#endif
+				tdq_trysteal(tdq);
+		}
 #endif
 	}
 
@@ -2473,12 +2475,9 @@ sched_ule_switch_generic(struct thread *td, int flags)
 	TDQ_LOCK_ASSERT(tdq, MA_OWNED | MA_NOTRECURSED);
 	MPASS(td == tdq->tdq_curthread);
 
+	newtd = NULL;
 #ifdef DOORFS
-	/*
-	 * A wake-reservation belongs only to the owner's next transition into
-	 * sleep.  If the owner reached the scheduler for preemption/yield/bind,
-	 * publish the target through the ordinary ULE runq before choosing.
-	 */
+	/* Preemption/yield cannot consume a wake reservation as a sleep. */
 	if (!shuttle_reserved &&
 	    (token->sst_flags & (SCHED_SHUTTLE_TOKEN_RESERVED |
 	    SCHED_SHUTTLE_TOKEN_WAKE_RESERVED)) ==
@@ -2487,20 +2486,22 @@ sched_ule_switch_generic(struct thread *td, int flags)
 	    token->sst_cur == td && token->sst_sched_data == tdq)
 		sched_ule_shuttle_restore_locked(tdq, token);
 
-	/*
-	 * Commit an already-reserved direct peer after outgoing-thread accounting.
-	 */
+	/* Commit only after normal outgoing-thread accounting, under TDQ. */
 	if (shuttle_reserved) {
 		newtd = sched_ule_shuttle_commit_locked(tdq, td, token);
 		if (newtd == NULL) {
 			sched_ule_shuttle_restore_locked(tdq, token);
-			newtd = choosethread();
-		}
-	} else
-		newtd = choosethread();
-#else
-	newtd = choosethread();
+#ifdef SMP
+			/* Stealing was deferred while the exact peer was reserved. */
+			if (tdq->tdq_load == 0)
+				tdq_trysteal(tdq);
 #endif
+		}
+	}
+#endif
+	if (newtd == NULL)
+		newtd = choosethread();
+
 	sched_pctcpu_update(td_get_sched(newtd), 0);
 	TDQ_UNLOCK(tdq);
 
@@ -2540,7 +2541,7 @@ sched_ule_switch_generic(struct thread *td, int flags)
 		 * invariant: the running thread is owned by the current CPU's tdq
 		 * lock and its scheduler CPU agrees with that tdq.
 		 */
-		if ((flags & SW_TYPE_MASK) == SWT_SHUTTLE) {
+		if (shuttle_reserved || (flags & SW_TYPE_MASK) == SWT_SHUTTLE) {
 			KASSERT(td == curthread,
 			    ("shuttle resume: td %p != curthread %p",
 			    td, curthread));
@@ -2582,219 +2583,13 @@ sched_ule_switch_generic(struct thread *td, int flags)
 }
 
 #ifdef DOORFS
-/*
- * Scheduler-instance switch entry.  Target-side WAKE_RESERVED tokens are
- * created while the current thread is still running and are intentionally
- * consumed by that owner's next ordinary sleep.  Route that already-validated
- * sleep directly to the shuttle backend instead of making it traverse the
- * generic ULE selection path first.
- */
-static void
-sched_ule_switch(struct thread *td, int flags)
-{
-	struct sched_shuttle_token *token;
-	struct tdq *tdq;
-	int cpuid;
-
-	THREAD_LOCK_ASSERT(td, MA_OWNED);
-	cpuid = PCPU_GET(cpuid);
-	tdq = TDQ_SELF();
-	token = &tdq->tdq_shuttle;
-
-	if (__predict_false((token->sst_flags &
-	    (SCHED_SHUTTLE_TOKEN_RESERVED |
-	    SCHED_SHUTTLE_TOKEN_WAKE_RESERVED)) ==
-	    (SCHED_SHUTTLE_TOKEN_RESERVED |
-	    SCHED_SHUTTLE_TOKEN_WAKE_RESERVED)) &&
-	    (TD_IS_SLEEPING(td) || TD_IS_SHUTTLE_WAIT(td)) &&
-	    token->sst_cur == td &&
-	    token->sst_sched_data == tdq && token->sst_cpu == cpuid &&
-	    token->sst_peer != NULL) {
-		sched_ule_shuttle_sswitch(td, flags);
-		return;
-	}
-
-	sched_ule_switch_generic(td, flags);
-}
-
-/*
- * Low-level ULE switch for an already-reserved shuttle successor.
- *
- * mi_switch_common() has already performed the machine-independent switch
- * accounting.  Unlike sched_ule_switch(), this path is entered only for a
- * voluntarily sleeping shuttle owner.  The target has already been selected
- * and reserved, so there is no migration/steal/generic choose work unless
- * final validation fails.
- */
+/* The MI shuttle switch hook shares ULE's normal switch implementation. */
 static void
 sched_ule_shuttle_sswitch(struct thread *td, int flags)
 {
-	struct sched_shuttle_token *token;
-	struct thread *newtd, *shuttle_peer __diagused;
-	struct td_sched *ts;
-	struct tdq *tdq;
-	struct mtx *mtx;
-	int cpuid;
-#ifdef SMP
-	int pickcpu;
-#endif
-
-	THREAD_LOCK_ASSERT(td, MA_OWNED);
-	cpuid = PCPU_GET(cpuid);
-	tdq = TDQ_SELF();
-	token = &tdq->tdq_shuttle;
-
-	/*
-	 * Explicit shuttle sleeps arrive as SWT_SHUTTLE.  A target-side wake
-	 * reservation is consumed by the owner's next ordinary sleep, normally
-	 * SWT_SLEEPQ.  Both cases already own an exact local successor and are
-	 * eligible for the same low-level switch.
-	 */
-	KASSERT((flags & SW_TYPE_MASK) == SWT_SHUTTLE ||
-	    ((token->sst_flags & (SCHED_SHUTTLE_TOKEN_RESERVED |
-	    SCHED_SHUTTLE_TOKEN_WAKE_RESERVED)) ==
-	    (SCHED_SHUTTLE_TOKEN_RESERVED |
-	    SCHED_SHUTTLE_TOKEN_WAKE_RESERVED)),
-	    ("direct shuttle sswitch: invalid switch reason %d token flags %#x",
-	    flags & SW_TYPE_MASK, token->sst_flags));
-
-	/*
-	 * Do not partially enter the fast path.  If reservation ownership or
-	 * state is not exactly what the high-level shuttle code promised, use
-	 * the proven generic ULE switch unchanged.
-	 */
-	if ((!TD_IS_SLEEPING(td) && !TD_IS_SHUTTLE_WAIT(td)) ||
-	    (token->sst_flags & SCHED_SHUTTLE_TOKEN_RESERVED) == 0 ||
-	    token->sst_cur != td || token->sst_sched_data != tdq ||
-	    token->sst_cpu != cpuid || token->sst_peer == NULL) {
-		sched_ule_switch_generic(td, flags);
-		return;
-	}
-	shuttle_peer = token->sst_peer;
-
-	/* Preserve the accounting/state updates from the ordinary ULE path. */
-	ts = td_get_sched(td);
-	sched_pctcpu_update(ts, 1);
-#ifdef SMP
-	pickcpu = (td->td_flags & TDF_PICKCPU) != 0;
-	if (pickcpu)
-		ts->ts_rltick = (u_int)ticks - affinity * MAX_CACHE_LEVELS;
-	else
-		ts->ts_rltick = (u_int)ticks;
-#endif
-	td->td_lastcpu = td->td_oncpu;
-	td->td_flags &= ~(TDF_PICKCPU | TDF_SLICEEND);
-	ast_unsched_locked(td, TDA_SCHED);
-	td->td_owepreempt = 0;
-	atomic_store_char(&tdq->tdq_owepreempt, 0);
-	if (!TD_IS_IDLETHREAD(td))
-		TDQ_SWITCHCNT_INC(tdq);
-
-	/*
-	 * The outgoing thread is already sleeping.  Block its thread lock and
-	 * acquire the local TDQ exactly as the sleeping branch of the generic
-	 * switch does.  cpu_switch() still receives the original lock pointer so
-	 * the standard thread-lock handoff protocol is preserved.
-	 */
-	mtx = thread_lock_block(td);
-	spinlock_enter();
-	KASSERT(!TD_IS_IDLETHREAD(td),
-	    ("direct shuttle switch attempted by idle thread"));
-	KASSERT(!TD_IS_RUNNING(td),
-	    ("direct shuttle switch owner %p unexpectedly running", td));
-	if (mtx != TDQ_LOCKPTR(tdq)) {
-		mtx_unlock_spin(mtx);
-		if ((token->sst_flags & SCHED_SHUTTLE_TOKEN_WAKE_RESERVED) == 0)
-			TDQ_LOCK_ASSERT(tdq, MA_OWNED | MA_NOTRECURSED);
-		else
-			TDQ_LOCK(tdq);
-	}
-
-	tdq_load_rem(tdq, td);
-	TDQ_LOCK_ASSERT(tdq, MA_OWNED | MA_NOTRECURSED);
-	MPASS(td == tdq->tdq_curthread);
-
-	newtd = sched_ule_shuttle_commit_locked(tdq, td, token);
-	if (__predict_false(newtd == NULL)) {
-		/*
-		 * Reservation changed after preflight.  Restore it and finish this
-		 * already-started switch through the ordinary chooser; all outgoing
-		 * accounting above is identical to the generic sleeping path.
-		 */
-		sched_ule_shuttle_restore_locked(tdq, token);
-#ifdef SMP
-		if (tdq->tdq_load == 0)
-			tdq_trysteal(tdq);
-#endif
-		newtd = choosethread();
-	} else {
-		KASSERT(newtd == shuttle_peer,
-		    ("direct shuttle selected %p instead of peer %p",
-		    newtd, shuttle_peer));
-	}
-
-	sched_pctcpu_update(td_get_sched(newtd), 0);
-	TDQ_UNLOCK(tdq);
-
-	if (td != newtd) {
-#ifdef HWPMC_HOOKS
-		if (PMC_PROC_IS_USING_PMCS(td->td_proc))
-			PMC_SWITCH_CONTEXT(td, PMC_FN_CSW_OUT);
-#endif
-		SDT_PROBE2(sched, , , off__cpu, newtd, newtd->td_proc);
-#ifdef KDTRACE_HOOKS
-		if (dtrace_vtime_active)
-			(*dtrace_vtime_switch_func)(newtd);
-#endif
-#ifdef HWT_HOOKS
-		HWT_CALL_HOOK(td, HWT_SWITCH_OUT, NULL);
-		HWT_CALL_HOOK(newtd, HWT_SWITCH_IN, NULL);
-#endif
-		td->td_oncpu = NOCPU;
-		cpu_switch(td, newtd, mtx);
-		/*
-		 * This invocation resumes when the original td becomes current
-		 * again.  Its wake stamp is therefore keyed by td, not by the peer
-		 * we switched to on the outgoing half.
-		 */
-		cpuid = td->td_oncpu = PCPU_GET(cpuid);
-
-		KASSERT(td == curthread,
-		    ("direct shuttle resume: td %p != curthread %p", td,
-		    curthread));
-		KASSERT(td->td_lock == TDQ_LOCKPTR(TDQ_SELF()),
-		    ("direct shuttle resume: td %p lock %p != tdq lock %p",
-		    td, td->td_lock, TDQ_LOCKPTR(TDQ_SELF())));
-		KASSERT(td_get_sched(td)->ts_cpu == cpuid,
-		    ("direct shuttle resume: td %p ts_cpu=%d != cpuid=%d",
-		    td, td_get_sched(td)->ts_cpu, cpuid));
-		KASSERT(TD_IS_RUNNING(td),
-		    ("direct shuttle resume: td %p state=%d not RUNNING",
-		    td, TD_GET_STATE(td)));
-
-		SDT_PROBE0(sched, , , on__cpu);
-#ifdef HWPMC_HOOKS
-		if (PMC_PROC_IS_USING_PMCS(td->td_proc))
-			PMC_SWITCH_CONTEXT(td, PMC_FN_CSW_IN);
-#endif
-	} else {
-		thread_unblock_switch(td, mtx);
-		SDT_PROBE0(sched, , , remain__cpu);
-	}
-	KASSERT(curthread->td_md.md_spinlock_count == 1,
-	    ("invalid count %d", curthread->td_md.md_spinlock_count));
-	KTR_STATE1(KTR_SCHED, "thread", sched_tdname(td), "running",
-	    "prio:%d", td->td_priority);
+	sched_ule_switch(td, flags);
 }
-
-#else
-static void
-sched_ule_switch(struct thread *td, int flags)
-{
-	sched_ule_switch_generic(td, flags);
-}
-
-#endif /* DOORFS */
+#endif
 
 /*
  * Adjust thread priorities as a result of a nice request.
@@ -3039,7 +2834,6 @@ sched_ule_userret_slowpath(struct thread *td)
 	thread_unlock(td);
 }
 
-
 /*
  * Return time slice for a given thread.  For ithreads this is
  * sched_slice.  For other threads it is tdq_slice(tdq).
@@ -3179,36 +2973,16 @@ sched_ule_commit_next(struct tdq *tdq, struct thread *td)
 	/*
 	 * tdq_runq_rem() removes the selected thread from the runq data
 	 * structure but intentionally leaves td_state == TDS_RUNQ until the
-	 * normal context-switch machinery completes the transition.  Keep this
-	 * helper identical for the ordinary choose path and shuttle direct
-	 * commit so both obey exactly the same ULE state convention.
+	 * normal context-switch machinery completes the transition.  Match the
+	 * ordinary chooser's lowpri/current-thread updates for a reserved peer.
 	 */
 	tdq->tdq_lowpri = td->td_priority;
 	tdq->tdq_curthread = td;
 	return (td);
 }
 
-static struct thread *
-sched_ule_choose(void)
-{
-	struct thread *td;
-	struct tdq *tdq;
+#endif
 
-	tdq = TDQ_SELF();
-	TDQ_LOCK_ASSERT(tdq, MA_OWNED);
-	td = tdq_choose(tdq);
-	if (td != NULL) {
-		tdq_runq_rem(tdq, td);
-		return (sched_ule_commit_next(tdq, td));
-	}
-
-	tdq->tdq_lowpri = PRI_MAX_IDLE;
-	td = PCPU_GET(idlethread);
-	tdq->tdq_curthread = td;
-	return (td);
-}
-
-#else
 static struct thread *
 sched_ule_choose(void)
 {
@@ -3221,7 +2995,7 @@ sched_ule_choose(void)
 	if (td != NULL) {
 		tdq_runq_rem(tdq, td);
 		tdq->tdq_lowpri = td->td_priority;
-	} else {
+	} else { 
 		tdq->tdq_lowpri = PRI_MAX_IDLE;
 		td = PCPU_GET(idlethread);
 	}
@@ -3229,7 +3003,6 @@ sched_ule_choose(void)
 	return (td);
 }
 
-#endif /* DOORFS */
 
 /*
  * Set owepreempt if the currently running thread has lower priority than "pri".
@@ -3301,7 +3074,7 @@ sched_ule_add(struct thread *td, int flags)
 	    sched_tdname(curthread));
 	KTR_POINT1(KTR_SCHED, "thread", sched_tdname(curthread), "wokeup",
 	    KTR_ATTR_LINKED, sched_tdname(td));
-	SDT_PROBE4(sched, , , enqueue, td, td->td_proc, NULL,
+	SDT_PROBE4(sched, , , enqueue, td, td->td_proc, NULL, 
 	    flags & SRQ_PREEMPTED);
 	THREAD_LOCK_ASSERT(td, MA_OWNED);
 	/*
@@ -3382,13 +3155,10 @@ sched_ule_pctcpu(struct thread *td)
 	ts = td_get_sched(td);
 	sched_pctcpu_update(ts, TD_IS_RUNNING(td));
 	len = SCHED_TICK_LENGTH(ts);
-#if FSHIFT >= SCHED_TICK_SHIFT
-	pctcpu = ((SCHED_TICK_RUN_SHIFTED(ts) <<
-	    (FSHIFT - SCHED_TICK_SHIFT)) + len / 2) / len;
-#else
-	pctcpu = ((SCHED_TICK_RUN_SHIFTED(ts) >>
-	    (SCHED_TICK_SHIFT - FSHIFT)) + len / 2) / len;
-#endif
+	pctcpu = ((FSHIFT >= SCHED_TICK_SHIFT ? /* Resolved at compile-time. */
+	    (SCHED_TICK_RUN_SHIFTED(ts) << (FSHIFT - SCHED_TICK_SHIFT)) :
+	    (SCHED_TICK_RUN_SHIFTED(ts) >> (SCHED_TICK_SHIFT - FSHIFT))) +
+	    len / 2) / len;
 	return (pctcpu);
 }
 
@@ -3396,44 +3166,6 @@ sched_ule_pctcpu(struct thread *td)
  * Enforce affinity settings for a thread.  Called after adjustments to
  * cpumask.
  */
-#ifdef DOORFS
-static void
-sched_ule_affinity(struct thread *td)
-{
-#ifdef SMP
-	struct td_sched *ts;
-
-	THREAD_LOCK_ASSERT(td, MA_OWNED);
-	ts = td_get_sched(td);
-	if (THREAD_CAN_SCHED(td, ts->ts_cpu))
-		return;
-	if (TD_IS_SHUTTLE(td)) {
-		/*
-		 * The reserved CPU is no longer legal.  Cancel into the ordinary
-		 * runq path; SRQ_HOLDTD preserves the caller's thread lock contract.
-		 */
-		sched_ule_shuttle_cancel(td, SRQ_HOLDTD);
-		return;
-	}
-	if (TD_ON_RUNQ(td)) {
-		sched_rem(td);
-		sched_add(td, SRQ_BORING | SRQ_HOLDTD);
-		return;
-	}
-	if (!TD_IS_RUNNING(td))
-		return;
-	/*
-	 * Force a switch before returning to userspace.  If the
-	 * target thread is not running locally send an ipi to force
-	 * the issue.
-	 */
-	ast_sched_locked(td, TDA_SCHED);
-	if (td != curthread)
-		ipi_cpu(ts->ts_cpu, IPI_PREEMPT);
-#endif
-}
-
-#else
 static void
 sched_ule_affinity(struct thread *td)
 {
@@ -3444,6 +3176,16 @@ sched_ule_affinity(struct thread *td)
 
 	if (THREAD_CAN_SCHED(td, ts->ts_cpu))
 		return;
+#ifdef DOORFS
+	if (TD_IS_SHUTTLE(td)) {
+		/*
+		 * The reserved CPU is no longer legal.  Cancel into the ordinary
+		 * runq path; SRQ_HOLDTD preserves the caller's thread lock contract.
+		 */
+		sched_ule_shuttle_cancel(td, SRQ_HOLDTD);
+		return;
+	}
+#endif
 
 	if (TD_ON_RUNQ(td)) {
 		sched_rem(td);
@@ -3463,8 +3205,6 @@ sched_ule_affinity(struct thread *td)
 		ipi_cpu(ts->ts_cpu, IPI_PREEMPT);
 #endif
 }
-
-#endif /* DOORFS */
 
 /*
  * Bind a thread to a target cpu.
@@ -3596,7 +3336,7 @@ sched_ule_idletd(void *dummy)
 #endif
 		/*
 		 * If we're switching very frequently, spin while checking
-		 * for load rather than entering a low power state that
+		 * for load rather than entering a low power state that 
 		 * may require an IPI.  However, don't do any busy
 		 * loops while on SMT machines as this simply steals
 		 * cycles from cores doing useful work.
@@ -3698,7 +3438,6 @@ sched_ule_ap_entry(void)
 /*
  * A thread is exiting.
  */
-#ifdef DOORFS
 static void
 sched_ule_throw(struct thread *td)
 {
@@ -3711,6 +3450,7 @@ sched_ule_throw(struct thread *td)
 	THREAD_LOCK_ASSERT(td, MA_OWNED);
 	THREAD_LOCKPTR_ASSERT(td, TDQ_LOCKPTR(tdq));
 
+#ifdef DOORFS
 	/*
 	 * This is the last scheduler-side point at which the exiting current
 	 * thread can still own a wake-reserved TDS_SHUTTLE peer.  Unlike the
@@ -3719,33 +3459,7 @@ sched_ule_throw(struct thread *td)
 	 */
 	sched_ule_shuttle_owner_exit(td);
 
-	tdq_load_rem(tdq, td);
-	td->td_lastcpu = td->td_oncpu;
-	td->td_oncpu = NOCPU;
-	thread_lock_block(td);
-
-	newtd = sched_throw_grab(tdq);
-
-#ifdef HWT_HOOKS
-	HWT_CALL_HOOK(newtd, HWT_SWITCH_IN, NULL);
 #endif
-
-	/* doesn't return */
-	cpu_switch(td, newtd, TDQ_LOCKPTR(tdq));
-}
-
-#else
-static void
-sched_ule_throw(struct thread *td)
-{
-	struct thread *newtd;
-	struct tdq *tdq;
-
-	tdq = TDQ_SELF();
-
-	MPASS(td != NULL);
-	THREAD_LOCK_ASSERT(td, MA_OWNED);
-	THREAD_LOCKPTR_ASSERT(td, TDQ_LOCKPTR(tdq));
 
 	tdq_load_rem(tdq, td);
 	td->td_lastcpu = td->td_oncpu;
@@ -3762,7 +3476,6 @@ sched_ule_throw(struct thread *td)
 	cpu_switch(td, newtd, TDQ_LOCKPTR(tdq));
 }
 
-#endif /* DOORFS */
 
 /*
  * This is called from fork_exit().  Just acquire the correct locks and
@@ -4466,49 +4179,6 @@ shuttle_switch_done:
 	return (SCHED_SHUTTLE_OK);
 }
 
-static enum sched_shuttle_result
-sched_ule_shuttle_can_direct(struct thread *td, struct thread *peer, int flags)
-{
-	struct td_sched *pts;
-	struct tdq *tdq;
-	bool locked_here;
-	int cpu;
-
-	(void)flags;
-	if (td != curthread || peer == NULL || peer == td)
-		return (SCHED_SHUTTLE_ABORTED);
-
-	tdq = TDQ_SELF();
-	cpu = PCPU_GET(cpuid);
-
-	/*
-	 * A direct ULE shuttle is useful only for a peer already owned by this
-	 * CPU's run queue.  Do not thread_lock(peer) here: the caller may itself
-	 * be transitioning through a sleepqueue and peer->td_lock can therefore
-	 * name the same sleepqueue-chain spin mutex that the caller already owns.
-	 *
-	 * Stabilize the only lock domain we are willing to accept instead.
-	 * can_direct() is advisory, so contention simply means FALLBACK.
-	 */
-	locked_here = !mtx_owned(TDQ_LOCKPTR(tdq));
-	if (locked_here && !TDQ_TRYLOCK_FLAGS(tdq, MTX_DUPOK))
-		return (SCHED_SHUTTLE_FALLBACK);
-
-	pts = td_get_sched(peer);
-	if (peer->td_lock != TDQ_LOCKPTR(tdq) ||
-	    !TD_ON_RUNQ(peer) ||
-	    pts->ts_cpu != cpu ||
-	    !THREAD_CAN_SCHED(peer, cpu) ||
-	    (peer->td_pinned != 0 && (pts->ts_flags & TSF_BOUND) == 0)) {
-		if (locked_here)
-			TDQ_UNLOCK(tdq);
-		return (SCHED_SHUTTLE_FALLBACK);
-	}
-
-	if (locked_here)
-		TDQ_UNLOCK(tdq);
-	return (SCHED_SHUTTLE_OK);
-}
 
 /*
  * Reserve a target directly after sleepqueue removal.
@@ -4760,8 +4430,8 @@ sched_ule_shuttle_take(struct thread *td, struct sched_shuttle_token *token,
 	 * the normal scheduler path.
 	 *
 	 * On success the tdq lock is intentionally retained in the token through
-	 * mi_switch_shuttle(); commit consumes the reserved peer, while rollback
-	 * restores it before releasing the same lock.
+	 * mi_switch_shuttle(); commit consumes the reserved peer, while a failed
+	 * commit restores it before the ordinary chooser runs.
 	 */
 	if (!TDQ_TRYLOCK_FLAGS(tdq, MTX_DUPOK))
 		return (SCHED_SHUTTLE_FALLBACK);
@@ -4795,8 +4465,8 @@ sched_ule_shuttle_take(struct thread *td, struct sched_shuttle_token *token,
 	/*
 	 * Remove the peer with ULE's normal primitive.  tdq_load is deliberately
 	 * unchanged: runnable and running threads both contribute to load.  The
-	 * peer lock remains held until rollback() puts it back in the exact same
-	 * runq bucket.
+	 * peer lock remains held through commit, or restoration to the saved
+	 * runq bucket if commit fails.
 	 */
 	tdq_runq_rem(tdq, peer);
 	token->sst_flags |= SCHED_SHUTTLE_TOKEN_RESERVED;
@@ -4912,45 +4582,7 @@ sched_ule_shuttle_commit_locked(struct tdq *tdq, struct thread *td,
 	return (peer);
 }
 
-static void
-sched_ule_shuttle_rollback(struct thread *td,
-    struct sched_shuttle_token *token)
-{
-	struct sched_shuttle *ss __diagused;
-	struct tdq *tdq;
-	struct thread *peer;
 
-	if (token == NULL ||
-	    (token->sst_flags & SCHED_SHUTTLE_TOKEN_VALIDATED) == 0) {
-		if (token != NULL)
-			bzero(token, sizeof(*token));
-		return;
-	}
-
-	THREAD_LOCK_ASSERT(td, MA_OWNED);
-	ss = sched_ule_shuttle_state(td);
-	KASSERT(token->sst_cur == td,
-	    ("shuttle rollback owner mismatch: token=%p td=%p",
-	    token->sst_cur, td));
-	KASSERT(token->sst_generation == ss->ss_generation,
-	    ("stale shuttle rollback: token=%ju current=%ju",
-	    (uintmax_t)token->sst_generation,
-	    (uintmax_t)ss->ss_generation));
-
-	peer = token->sst_peer;
-	tdq = token->sst_sched_data;
-	KASSERT(peer != NULL && tdq != NULL,
-	    ("reserved shuttle token lacks peer or tdq"));
-	sched_ule_shuttle_restore_locked(tdq, token);
-	thread_unlock(peer);
-}
-
-static void
-sched_ule_door_producer(struct thread *td)
-{
-
-	(void)td;
-}
 
 static void
 sched_ule_shuttle_abort(struct thread *td)
@@ -5062,8 +4694,6 @@ sched_ule_find_l2_neighbor(int cpu)
 }
 #endif
 
-DECLARE_SCHEDULER(ule, "ULE");
-
 static int
 sysctl_kern_quantum(SYSCTL_HANDLER_ARGS)
 {
@@ -5145,3 +4775,5 @@ SYSCTL_INT(_kern_sched_ule, OID_AUTO, always_steal, CTLFLAG_RWTUN,
     &always_steal, 0,
     "Always run the stealer from the idle thread");
 #endif
+
+DECLARE_SCHEDULER(ule, "ULE");

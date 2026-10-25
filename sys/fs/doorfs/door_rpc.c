@@ -2017,8 +2017,6 @@ door_async_call(struct door *door, struct door *target,
 	if (error != 0)
 		goto fail;
 
-	sched_door_producer(td);
-
 	door_call_local_drop(call);
 
 	return (0);
@@ -2145,7 +2143,6 @@ door_oneway_submit(
 	if (dispatch_ds != NULL)
 		door_server_wake_async_locked(dispatch_ds);
 	mtx_unlock(&door->d_lock);
-	sched_door_producer(td);
 
 	door_call_local_drop(call); /* submitter ownership */
 	return (0);
@@ -2334,7 +2331,6 @@ door_call(struct door *door, struct door_ioc_call *arg, struct thread *td,
 			arg->dic_recv_desc_count = 0;
 			arg->dic_recv_fd = -1;
 			mtx_unlock(&door->d_lock);
-			sched_door_producer(td);
 			door_call_local_drop(
 			    call); /* submitting-thread local reference */
 			return (0);
