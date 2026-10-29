@@ -42,6 +42,13 @@ _Static_assert(sizeof(uint64_t) == 8, "uint64_t stays 64-bit in both ABIs");
 _Static_assert(sizeof(uid_t) == 4 && sizeof(gid_t) == 4 && sizeof(pid_t) == 4,
     "FreeBSD credential scalar widths");
 
+DOOR_ABI_SIZE(struct door_ioc_shm_pair, 32);
+DOOR_ABI_OFFSET(struct door_ioc_shm_pair, disp_region, 8);
+DOOR_ABI_OFFSET(struct door_ioc_shm_pair, disp_timeout_ns, 16);
+DOOR_ABI_OFFSET(struct door_ioc_shm_pair, disp_expected, 24);
+DOOR_ABI_SIZE(door_shm_chain_t, 1064);
+DOOR_ABI_OFFSET(door_shm_chain_t, dsc_segments, 40);
+
 /* struct door_kdesc */
 DOOR_ABI_SIZE(struct door_kdesc, 8);
 DOOR_ABI_ALIGN(struct door_kdesc, 4);

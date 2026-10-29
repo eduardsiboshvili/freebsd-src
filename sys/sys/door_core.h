@@ -100,6 +100,24 @@ struct door_kdesc {
 #define DOOR_SC_SHM_VIEW_QUERY 29U
 #define DOOR_SC_SHM_VIEW_RELEASE 30U
 #define DOOR_SC_SHM_VIEW_DESTROY 31U
+#define DOOR_SC_SHM_PAIR_WAIT 32U
+#define DOOR_SC_SHM_PAIR_WAKE 33U
+
+/* Two independent event words, in separate cache lines of the first page. */
+#define DOOR_SHM_PAIR_LANES 2U
+#define DOOR_SHM_PAIR_STRIDE 64U
+#define DOOR_SHM_PAIR_CONTROL_SIZE 128U
+#define DOOR_SHM_PAIR_TIMEOUT_MAX_NS 86400000000000ULL
+#define DOOR_SHM_PAIR_FOREVER (~(uint64_t)0)
+
+struct door_ioc_shm_pair {
+    uint32_t disp_version;
+    uint32_t disp_lane;
+    uint64_t disp_region;
+    uint64_t disp_timeout_ns; /* relative duration, UINT64_MAX = infinite */
+    uint32_t disp_expected;
+    uint32_t disp_reserved;
+};
 
 #define DOOR_SHM_VIEW_MAX_SEGMENTS 64
 #define DOOR_SHM_VIEW_PUBLISHED 1
@@ -278,7 +296,8 @@ struct door_ioc_info {
 #define DOOR_SHM_F_WRITE 0x00000002U
 #define DOOR_SHM_F_RW (DOOR_SHM_F_READ | DOOR_SHM_F_WRITE)
 #define DOOR_SHM_F_CONSUMER_RO 0x00000004U
-#define DOOR_SHM_F_MASK (DOOR_SHM_F_RW | DOOR_SHM_F_CONSUMER_RO)
+#define DOOR_SHM_F_PAIR 0x00000008U
+#define DOOR_SHM_F_MASK (DOOR_SHM_F_RW | DOOR_SHM_F_CONSUMER_RO | DOOR_SHM_F_PAIR)
 
 struct door_ioc_shm_ref {
 	uint64_t disr_region;

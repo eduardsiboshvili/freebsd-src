@@ -147,7 +147,8 @@ typedef uint64_t door_shm_id_t;
 #define DOOR_SHM_WRITE         0x00000002U
 #define DOOR_SHM_RW            (DOOR_SHM_READ | DOOR_SHM_WRITE)
 #define DOOR_SHM_CONSUMER_RO   0x00000004U
-#define DOOR_SHM_FLAG_MASK     (DOOR_SHM_RW | DOOR_SHM_CONSUMER_RO)
+#define DOOR_SHM_PAIR          0x00000008U
+#define DOOR_SHM_FLAG_MASK     (DOOR_SHM_RW | DOOR_SHM_CONSUMER_RO | DOOR_SHM_PAIR)
 
 /* Region ids, held objects and VM mappings have separate lifetimes. Destroy
  * invalidates future export, even after capture, but leaves existing mappings.
@@ -340,6 +341,39 @@ int door_async_close(door_async_t *);
  * UNMAP only removes the local mapping; DESTROY invalidates the creator-owned
  * region handle but deliberately does not unmap either participant.
  */
+/* Pair regions reserve their first VM page for two 32-bit event words.
+ * No field in that page authorizes access to another region or allocation. */
+int door_shm_pair_create(int, size_t, door_shm_t *);
+int door_shm_pair_attach(int, door_shm_id_t, door_shm_t *);
+int door_shm_pair_load(const door_shm_t *, uint_t, uint32_t *);
+int door_shm_pair_notify(const door_shm_t *, uint_t);
+int door_shm_pair_wait(const door_shm_t *, uint_t, uint32_t, uint64_t);
+
+#define DOOR_SHM_CHAIN_MAX_SEGMENTS 64U
+struct door_shm_chain_segment {
+    uint64_t dcs_offset;
+    uint64_t dcs_length;
+};
+typedef struct door_shm_chain {
+    uint64_t dsc_region;
+    uint64_t dsc_uniquifier;
+    uint64_t dsc_lease;
+    uint64_t dsc_length;
+    uint32_t dsc_count;
+    uint32_t dsc_reserved;
+    struct door_shm_chain_segment dsc_segments[DOOR_SHM_CHAIN_MAX_SEGMENTS];
+} door_shm_chain_t;
+struct door_shm_pool;
+typedef struct door_shm_pool door_shm_pool_t;
+struct iovec;
+int door_shm_pool_create(int, size_t, uint_t, door_shm_pool_t **);
+const door_shm_t *door_shm_pool_region(const door_shm_pool_t *);
+int door_shm_pool_reserve(door_shm_pool_t *, size_t, door_shm_chain_t *);
+int door_shm_pool_release(door_shm_pool_t *, const door_shm_chain_t *);
+int door_shm_pool_destroy(door_shm_pool_t *);
+int door_shm_chain_map(const door_shm_t *, const door_shm_chain_t *,
+    struct iovec *, uint_t);
+
 int door_shm_create(int, size_t, uint_t, door_shm_t *);
 int door_shm_attach(int, door_shm_id_t, uint_t, door_shm_t *);
 int door_shm_unmap(door_shm_t *);

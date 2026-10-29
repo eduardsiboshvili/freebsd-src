@@ -38,6 +38,7 @@ TESTS_SUBDIRS=	abi \
 	oneway \
 	shared_memory \
 	shm_view \
+	shm_pair \
 	shm_ring \
 	shm_fd_reuse \
 	signals \

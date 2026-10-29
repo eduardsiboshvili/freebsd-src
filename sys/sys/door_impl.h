@@ -318,6 +318,8 @@ int door_shm_server_export_locked(
     struct door_call *, struct thread *, struct door_ioc_shm_ref *, uint64_t *);
 void door_shm_region_drop(struct door_shm_region *);
 void door_shm_revoke_all(struct door *);
+int door_shm_pair_op(struct door *, const struct door_ioc_shm_pair *,
+    unsigned int, struct thread *);
 int door_shm_view_op(struct door *, struct door_ioc_shm_view *,
     const struct door_ioc_shm_view_segment *, unsigned int, struct thread *);
 bool door_shm_view_exit_pending(struct door *, pid_t);

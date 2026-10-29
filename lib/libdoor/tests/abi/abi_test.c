@@ -274,7 +274,7 @@ ATF_TC_BODY(compat_word_decode, tc)
     ATF_REQUIRE_EQ(door_compat_decode(DOOR_SC_ASYNC_CANCEL, words, &out), 0);
     ATF_REQUIRE_EQ(out.arg[1], (int32_t)words[1]);
     ATF_REQUIRE_EQ(out.arg[2], UINT32_C(0x87654321));
-    for (op = DOOR_SC_CALL; op <= DOOR_SC_SHM_VIEW_DESTROY; op++) {
+    for (op = DOOR_SC_CALL; op <= DOOR_SC_SHM_PAIR_WAKE; op++) {
         error = door_compat_decode(op, words, &out);
         if (op == DOOR_SC_FAST_CALL || op == DOOR_SC_FAST_RETURN ||
             op == DOOR_SC_EMPTY_CALL || op == DOOR_SC_EMPTY_RETURN ||

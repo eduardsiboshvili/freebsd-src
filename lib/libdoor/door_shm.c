@@ -29,7 +29,8 @@ door_shm_validate_create_flags(uint_t flags)
 static int
 door_shm_validate_attach_flags(uint_t flags)
 {
-    if ((flags & ~DOOR_SHM_RW) != 0 || (flags & DOOR_SHM_RW) == 0) {
+    if ((flags & ~(DOOR_SHM_RW | DOOR_SHM_PAIR)) != 0 ||
+        (flags & DOOR_SHM_RW) == 0) {
         errno = EINVAL;
         return (-1);
     }

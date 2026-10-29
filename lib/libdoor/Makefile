@@ -5,7 +5,7 @@ LIB=		door
 SHLIB_MAJOR=	1
 HAS_TESTS=
 
-MAN=		door.2 door.3 doorfs.4 namefs.4
+MAN=		door.2 door.3 door_shm_pair.3 doorfs.4 namefs.4
 MLINKS=		door.3 door_create.3 \
 		door.3 door_revoke.3 \
 		door.3 door_info.3 \
@@ -58,6 +58,18 @@ MLINKS=		door.3 door_create.3 \
 		door.3 door_named_lookup.3 \
 		door.3 door_named_connect.3
 
+MLINKS+= door_shm_pair.3 door_shm_pair_create.3 \
+    door_shm_pair.3 door_shm_pair_attach.3 \
+    door_shm_pair.3 door_shm_pair_load.3 \
+    door_shm_pair.3 door_shm_pair_notify.3 \
+    door_shm_pair.3 door_shm_pair_wait.3 \
+    door_shm_pair.3 door_shm_pool_create.3 \
+    door_shm_pair.3 door_shm_pool_region.3 \
+    door_shm_pair.3 door_shm_pool_reserve.3 \
+    door_shm_pair.3 door_shm_pool_release.3 \
+    door_shm_pair.3 door_shm_pool_destroy.3 \
+    door_shm_pair.3 door_shm_chain_map.3
+
 SUBDIR.${MK_TESTS}+=	tests
 
 SRCS=	 door_attach.c \
@@ -75,7 +87,9 @@ SRCS=	 door_attach.c \
 	 door_safe.c \
 	 door_server.c \
 	 door_shm_view.c \
-	 door_shm.c
+	 door_shm.c \
+	 door_shm_pair.c \
+	 door_shm_pool.c
 
 CFLAGS+=	-I${SRCTOP}/include -I${SRCTOP}/sys
 LIBADD=		pthread

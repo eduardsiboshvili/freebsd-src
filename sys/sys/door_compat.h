@@ -81,6 +81,8 @@ door_compat_decode(uint32_t op, const uint32_t words[5],
     case DOOR_SC_SHM_VIEW_ATTACH:
     case DOOR_SC_SHM_VIEW_QUERY:
     case DOOR_SC_SHM_VIEW_RELEASE:
+    case DOOR_SC_SHM_PAIR_WAIT:
+    case DOOR_SC_SHM_PAIR_WAKE:
     case DOOR_SC_SHM_VIEW_DESTROY:
         out->arg[0] = (int32_t)words[0];
         out->arg[1] = words[1];

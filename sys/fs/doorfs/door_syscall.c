@@ -930,6 +930,33 @@ door_sys_async_cancel_full(struct thread *td, long value, unsigned long uptr)
 }
 
 static int
+door_sys_shm_pair(struct thread *td, long value, unsigned long uptr,
+    unsigned int op)
+{
+    struct door_ioc_shm_pair arg;
+    struct door *door;
+    struct file *fp;
+    int error, fd, stop_prev;
+
+    error = door_sys_decode_fd(value, &fd);
+    if (error != 0)
+        return (error);
+
+    error = door_sys_copyin(td, (void *)(uintptr_t)uptr, &arg, sizeof(arg));
+    if (error != 0)
+        return (error);
+
+    error = door_sys_enter(td, fd, &door_shm_rights, false,
+        SIGDEFERSTOP_SILENT, &fp, &door, &stop_prev);
+    if (error != 0)
+        return (error);
+
+    error = door_shm_pair_op(door, &arg, op, td);
+    door_sys_leave(td, fp, stop_prev);
+    return (error);
+}
+
+static int
 door_sys_shm_view(struct thread *td, long value, unsigned long uptr,
     unsigned int op)
 {
@@ -999,6 +1026,9 @@ kern_door(struct thread *td, long op, long arg1, long arg2, long arg3,
 {
 #ifdef DOORFS
 	switch (op) {
+    case DOOR_SC_SHM_PAIR_WAIT:
+    case DOOR_SC_SHM_PAIR_WAKE:
+        return (door_sys_shm_pair(td, arg1, arg2, (unsigned int)op));
     case DOOR_SC_SHM_VIEW_PUBLISH:
     case DOOR_SC_SHM_VIEW_ATTACH:
     case DOOR_SC_SHM_VIEW_QUERY:

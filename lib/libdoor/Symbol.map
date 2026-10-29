@@ -30,6 +30,17 @@ LIBDOOR_1.0 {
         door_shm_view_release;
         door_shm_view_destroy;
         door_shm_view_close;
+        door_shm_pair_create;
+        door_shm_pair_attach;
+        door_shm_pair_load;
+        door_shm_pair_notify;
+        door_shm_pair_wait;
+        door_shm_pool_create;
+        door_shm_pool_region;
+        door_shm_pool_reserve;
+        door_shm_pool_release;
+        door_shm_pool_destroy;
+        door_shm_chain_map;
         door_shm_create;
         door_shm_attach;
         door_shm_unmap;
