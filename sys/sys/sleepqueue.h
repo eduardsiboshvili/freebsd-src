@@ -108,7 +108,7 @@ int	sleepq_timedwait_sig(const void *wchan, int pri);
 int	sleepq_type(const void *wchan);
 void	sleepq_wait(const void *wchan, int pri);
 int	sleepq_wait_sig(const void *wchan, int pri);
-
+bool	sleepq_same_chain(const void *wchan1, const void *wchan2);
 #ifdef STACK
 struct sbuf;
 int sleepq_sbuf_print_stacks(struct sbuf *sb, const void *wchan, int queue,

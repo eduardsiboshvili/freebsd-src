@@ -544,4 +544,5 @@
 #define	SYS_pdopenpid	603
 #define	SYS_pddupfd	604
 #define	SYS_pdptrace	605
-#define	SYS_MAXSYSCALL	606
+#define	SYS_door	606
+#define	SYS_MAXSYSCALL	607

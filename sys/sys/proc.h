@@ -74,6 +74,8 @@
 #include <machine/cpu.h>
 #endif
 
+struct door_server_binding;
+
 /*
  * One structure allocated per session.
  *
@@ -247,7 +249,7 @@ struct thread {
 	struct seltd	*td_sel;	/* Select queue/channel. */
 	struct sleepqueue *td_sleepqueue; /* (k) Associated sleep queue. */
 	struct turnstile *td_turnstile;	/* (k) Associated turnstile. */
-	void		*td_pad1;	/* Available */
+	struct door_server_binding *td_door_server; /* Door worker binding. */
 	struct umtx_q   *td_umtxq;	/* (c?) Link for when we're blocked. */
 	lwpid_t		td_tid;		/* (b) Thread ID. */
 	sigqueue_t	td_sigqueue;	/* (c) Sigs arrived, not delivered. */
@@ -355,7 +357,25 @@ struct thread {
 		TDS_INHIBITED,
 		TDS_CAN_RUN,
 		TDS_RUNQ,
-		TDS_RUNNING
+		TDS_RUNNING,
+		/*
+		 * Reserved same-CPU shuttle successor.
+		 *
+		 * The thread is runnable only through the current CPU's shuttle
+		 * reservation token.  It is on neither a sleepqueue nor the ordinary
+		 * scheduler runq and is not counted in tdq_load until the reservation
+		 * is committed or restored.  TDS_SHUTTLE must never represent a
+		 * cross-CPU migration in progress.
+		 *
+		 * Appended so historical TDS_* numeric values are unchanged.
+		 */
+		TDS_SHUTTLE,
+		/*
+		 * Exact-peer shuttle wait.  The thread is blocked, but is not on a
+		 * generic sleepqueue or scheduler runq.  A reply/signal converts it
+		 * directly to a runnable or reserved shuttle target.
+		 */
+		TDS_SHUTTLE_WAIT
 	} td_state;			/* (t) thread state */
 	/* Note: td_state must be accessed using TD_{GET,SET}_STATE(). */
 	union {
@@ -599,18 +619,24 @@ enum {
 #define	TD_IS_RUNNING(td)	(TD_GET_STATE(td) == TDS_RUNNING)
 #define	TD_ON_RUNQ(td)		(TD_GET_STATE(td) == TDS_RUNQ)
 #define	TD_CAN_RUN(td)		(TD_GET_STATE(td) == TDS_CAN_RUN)
+#define	TD_IS_SHUTTLE(td)	(TD_GET_STATE(td) == TDS_SHUTTLE)
+#define	TD_IS_SHUTTLE_WAIT(td)	(TD_GET_STATE(td) == TDS_SHUTTLE_WAIT)
 #define	TD_IS_INHIBITED(td)	(TD_GET_STATE(td) == TDS_INHIBITED)
 #define	TD_ON_UPILOCK(td)	((td)->td_flags & TDF_UPIBLOCKED)
 #define TD_IS_IDLETHREAD(td)	((td)->td_flags & TDF_IDLETD)
 
-#define	TD_CAN_ABORT(td)	(TD_ON_SLEEPQ((td)) &&			\
+#define	TD_CAN_ABORT(td)	((TD_ON_SLEEPQ((td)) ||			\
+				    TD_IS_SHUTTLE_WAIT((td))) &&		\
 				    ((td)->td_flags & TDF_SINTR) != 0)
 
 #define	KTDSTATE(td)							\
-	(((td)->td_inhibitors & TDI_SLEEPING) != 0 ? "sleep"  :		\
+	(TD_IS_SHUTTLE_WAIT(td) ? "shuttle-wait" :			\
+	(TD_IS_SHUTTLE(td) ? "shuttle" :				\
+	((td)->td_inhibitors & TDI_SLEEPING) != 0 ? "sleep"  :		\
 	((td)->td_inhibitors & TDI_SUSPENDED) != 0 ? "suspended" :	\
 	((td)->td_inhibitors & TDI_LOCK) != 0 ? "blocked" :		\
-	((td)->td_inhibitors & TDI_IWAIT) != 0 ? "iwait" : "yielding")
+	((td)->td_inhibitors & TDI_IWAIT) != 0 ? "iwait" : "yielding"))
+
 
 #define	TD_SET_INHIB(td, inhib) do {		\
 	TD_SET_STATE(td, TDS_INHIBITED);	\
@@ -642,7 +668,8 @@ enum {
 #define	TD_SET_RUNNING(td)	TD_SET_STATE(td, TDS_RUNNING)
 #define	TD_SET_RUNQ(td)		TD_SET_STATE(td, TDS_RUNQ)
 #define	TD_SET_CAN_RUN(td)	TD_SET_STATE(td, TDS_CAN_RUN)
-
+#define	TD_SET_SHUTTLE(td)	TD_SET_STATE(td, TDS_SHUTTLE)
+#define	TD_SET_SHUTTLE_WAIT(td)	TD_SET_STATE(td, TDS_SHUTTLE_WAIT)
 
 #define	TD_SBDRY_INTR(td) \
     (((td)->td_flags & (TDF_SEINTR | TDF_SERESTART)) != 0)
@@ -949,7 +976,8 @@ struct proc {
 #define	SWT_REMOTEPREEMPT	9	/* Remote processor preempted. */
 #define	SWT_REMOTEWAKEIDLE	10	/* Remote processor preempted idle. */
 #define	SWT_BIND		11	/* Thread bound to a new CPU. */
-#define	SWT_COUNT		12	/* Number of switch types. */
+#define	SWT_SHUTTLE		12	/* Direct scheduler shuttle handoff. */
+#define	SWT_COUNT		13	/* Number of switch types. */
 /* Flags */
 #define	SW_VOL		0x0100		/* Voluntary switch. */
 #define	SW_INVOL	0x0200		/* Involuntary switch. */
@@ -1194,6 +1222,8 @@ void	killjobc(void);
 int	leavepgrp(struct proc *p);
 void	maybe_yield(void);
 void	mi_switch(int flags);
+void	mi_switch_shuttle(int flags);
+struct thread *choosethread_commit(struct thread *td);
 int	p_candebug(struct thread *td, struct proc *p);
 int	p_canopen(struct thread *td, struct proc *p);
 int	p_cansee(struct thread *td, struct proc *p);

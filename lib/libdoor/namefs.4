@@ -1,0 +1,99 @@
+.Dd October 9, 2026
+.Dt NAMEFS 4
+.Os
+.Sh NAME
+.Nm namefs
+.Nd publish a Door capability at a filesystem pathname
+.Sh SYNOPSIS
+.Cd "options DOORFS"
+.Cd "options NAMEFS"
+.In door.h
+.Ft int
+.Fn fattach "int doorfd" "const char *path"
+.Ft int
+.Fn fdetach "const char *path"
+.Sh DESCRIPTION
+.Nm
+is a file-mount filesystem used by
+.Xr fattach 3
+to publish a live Door descriptor at an existing regular-file pathname.
+It does not provide a separately mountable namespace and anonymous mounts are
+not supported.
+.Pp
+Opening a live publication atomically replaces the provisional vnode file with
+a native Door client capability.
+A successful
+.Xr open 2
+therefore always selects and pins one live Door generation.
+If the publication is in recovery, its target is absent, the Door is revoked,
+or jail policy denies the caller, open fails without returning an ordinary
+vnode descriptor.
+.Ss Attach, detach, and rebind
+.Xr fattach 3
+creates a publication.
+Attaching to an existing publication performs a rebind: new opens select the
+new generation while capabilities opened earlier remain pinned to their old
+generation.
+An already revoked or orphaning Door is rejected.
+.Pp
+.Xr fdetach 3
+validates that the pathname resolves to namefs and unmounts the exact
+filesystem ID.
+Detaching removes discovery through the pathname but does not invalidate
+already-open Door capabilities.
+An active publication point cannot be unlinked or renamed.
+.Ss Owner exit and recovery
+Owner exit revokes the Door immediately and schedules bounded namefs GC
+probes across publications. A revoked target can reject open before the mount
+state changes. GC enters RECOVERY when only namefs holds the target file
+reference; inherited or duplicated target references can delay that transition.
+External vnode references are a separate criterion: they keep the publication
+available for rebind. An orphaned mount without those references can be
+unmounted asynchronously. Rebind resets the target and probe budget; a failed
+unmount restores RECOVERY.
+.Ss Nullfs stacking
+Publishing namefs on a nullfs vnode is supported.
+Detachment uses the validated filesystem ID so it does not depend on ambiguous
+pathname reconstruction through the stack.
+.Pp
+Mounting nullfs above a directory that already contains a nested namefs file
+mount follows normal nullfs semantics: the nullfs view exposes the covered
+placeholder, not the nested namefs mount.
+The placeholder is not a Door and Door operations on it fail.
+The original namefs pathname remains usable.
+.Ss Jails
+A same-prison open is allowed subject to normal mode checks.
+A host publication is hidden from a jailed opener unless its Door was created
+with
+.Dv DOOR_CROSS_JAIL .
+The policy is checked when open creates the descriptor capability.
+.Sh ERRORS
+.Bl -tag -width Er
+.It Bq Er EINVAL
+The target is not suitable for a namefs file mount, the descriptor is not a
+Door, or detach does not resolve to namefs.
+.It Bq Er EBADF
+The Door is revoked, orphaning, or otherwise not live.
+.It Bq Er ENXIO
+The publication has no live target or is in recovery.
+.It Bq Er EACCES
+Mode or jail policy denies capability acquisition.
+.It Bq Er EBUSY
+The pathname is already mounted in an incompatible way or the mount is busy.
+.El
+.Sh SEE ALSO
+.Xr open 2 ,
+.Xr door 3 ,
+.Xr fattach 3 ,
+.Xr fdetach 3 ,
+.Xr doorfs 4 ,
+.Xr nullfs 4 ,
+.Xr jail 8
+.Sh HISTORY
+.Nm
+first appeared in this FreeBSD Doors implementation.
+.Sh SECURITY CONSIDERATIONS
+The pathname grants discovery, not ambient authority beyond normal open
+checks.
+After open succeeds, the resulting descriptor is the authority and remains
+valid across detach or rebind until revoked or closed.

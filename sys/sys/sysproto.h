@@ -1948,6 +1948,14 @@ struct pdptrace_args {
 	char addr_l_[PADL_(void *)]; void * addr; char addr_r_[PADR_(void *)];
 	char data_l_[PADL_(int)]; int data; char data_r_[PADR_(int)];
 };
+struct door_args {
+	char op_l_[PADL_(long)]; long op; char op_r_[PADR_(long)];
+	char arg1_l_[PADL_(long)]; long arg1; char arg1_r_[PADR_(long)];
+	char arg2_l_[PADL_(long)]; long arg2; char arg2_r_[PADR_(long)];
+	char arg3_l_[PADL_(long)]; long arg3; char arg3_r_[PADR_(long)];
+	char arg4_l_[PADL_(long)]; long arg4; char arg4_r_[PADR_(long)];
+	char arg5_l_[PADL_(long)]; long arg5; char arg5_r_[PADR_(long)];
+};
 int	sys__exit(struct thread *, struct _exit_args *);
 int	sys_fork(struct thread *, struct fork_args *);
 int	sys_read(struct thread *, struct read_args *);
@@ -2361,6 +2369,7 @@ int	sys_renameat2(struct thread *, struct renameat2_args *);
 int	sys_pdopenpid(struct thread *, struct pdopenpid_args *);
 int	sys_pddupfd(struct thread *, struct pddupfd_args *);
 int	sys_pdptrace(struct thread *, struct pdptrace_args *);
+int	sys_door(struct thread *, struct door_args *);
 
 #ifdef COMPAT_43
 
@@ -3366,6 +3375,7 @@ int	freebsd14_setgroups(struct thread *, struct freebsd14_setgroups_args *);
 #define	SYS_AUE_pdopenpid	AUE_PDOPENPID
 #define	SYS_AUE_pddupfd	AUE_NULL
 #define	SYS_AUE_pdptrace	AUE_PDPTRACE
+#define	SYS_AUE_door	AUE_NULL
 
 #undef PAD_
 #undef PADL_

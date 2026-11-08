@@ -37,6 +37,7 @@
 #include "opt_hwpmc_hooks.h"
 #include "opt_hwt_hooks.h"
 #include "opt_sched.h"
+#include "opt_doorfs.h"
 
 #include <sys/systm.h>
 #include <sys/cpuset.h>
@@ -51,6 +52,9 @@
 #define SCHED_IMPLEMENTATION	4bsd
 #include <sys/sched.h>
 #include <sys/sdt.h>
+#ifdef DOORFS
+#include <sys/sleepqueue.h>
+#endif
 #include <sys/smp.h>
 #include <sys/sysctl.h>
 #include <sys/sx.h>
@@ -105,6 +109,9 @@ struct td_sched {
 	int		ts_slice;	/* Remaining part of time slice. */
 	int		ts_flags;
 	int		ts_rqcpu;	/* That CPU's runq or NOCPU => global */
+#ifdef DOORFS
+	struct sched_shuttle ts_shuttle; /* Scheduler handoff state. */
+#endif
 #ifdef KTR
 	char		ts_name[TS_NAME_LEN];
 #endif
@@ -119,6 +126,9 @@ struct td_sched {
 
 /* flags kept in ts_flags */
 #define	TSF_AFFINITY	0x0001		/* Has a non-"full" CPU set. */
+#ifdef DOORFS
+#define	TSF_DOOR_LOCAL	0x0002		/* Keep an active Door thread local. */
+#endif
 
 #ifdef SMP
 #define TS_RUNQ_PTR(ts)	((ts)->ts_rqcpu == NOCPU ?	\
@@ -155,8 +165,20 @@ static void	maybe_resched(struct thread *td);
 static void	updatepri(struct thread *td);
 static void	resetpriority(struct thread *td);
 static void	resetpriority_thread(struct thread *td);
+#ifdef DOORFS
+static inline struct sched_shuttle *sched_4bsd_shuttle_state(struct thread *);
+static void sched_4bsd_wakeup_account(struct thread *);
+static struct thread *sched_4bsd_shuttle_choose(void);
+static enum sched_shuttle_result sched_4bsd_shuttle_park(struct thread *, int);
+static void sched_4bsd_shuttle_wakeup_async(struct thread *);
+static void sched_4bsd_shuttle_restore_locked(struct sched_shuttle_token *);
+#endif
 #ifdef SMP
 static int	sched_pickcpu(struct thread *td);
+#ifdef DOORFS
+static int	sched_pickcpu_door(struct thread *td);
+static void	kick_other_cpu_door(struct thread *td, int cpuid);
+#endif
 static int	forward_wakeup(int cpunum);
 static void	kick_other_cpu(int pri, int cpuid);
 #endif
@@ -184,6 +206,12 @@ static struct runq runq_global;
  */
 DPCPU_DEFINE_STATIC(struct runq, runq_pcpu);
 DPCPU_DEFINE_STATIC(long, runq_length);
+#ifdef DOORFS
+DPCPU_DEFINE_STATIC(u_int, door_idle_hot);
+DPCPU_DEFINE_STATIC(u_int, door_idle_spinning);
+DPCPU_DEFINE_STATIC(u_char, door_remote_handoff);
+DPCPU_DEFINE_STATIC(struct thread *, door_idle_handoff);
+#endif
 
 static cpuset_t idle_cpus_mask;
 #endif
@@ -193,6 +221,11 @@ struct pcpuidlestat {
 	u_int oldidlecalls;
 };
 DPCPU_DEFINE_STATIC(struct pcpuidlestat, idlestat);
+
+#ifdef DOORFS
+/* One exact successor reservation per CPU, protected by sched_lock. */
+DPCPU_DEFINE_STATIC(struct sched_shuttle_token, shuttle_token);
+#endif
 
 static void
 setup_runqs(void)
@@ -260,6 +293,13 @@ static SYSCTL_NODE(_kern_sched_4bsd, OID_AUTO, ipiwakeup,
 static int runq_fuzz = 1;
 SYSCTL_INT(_kern_sched_4bsd, OID_AUTO, runq_fuzz, CTLFLAG_RW,
     &runq_fuzz, 0, "");
+
+#ifdef DOORFS
+/* Match ULE's default length, but spin only after Door activity. */
+static u_int door_idlespins = 10000;
+SYSCTL_UINT(_kern_sched_4bsd, OID_AUTO, door_idlespins, CTLFLAG_RWTUN,
+    &door_idlespins, 0, "Door-hot idle spin iterations");
+#endif
 
 static int forward_wakeup_enabled = 1;
 SYSCTL_INT(_kern_sched_4bsd_ipiwakeup, OID_AUTO, enabled, CTLFLAG_RW,
@@ -1010,6 +1050,10 @@ sched_sleep(struct thread *td, int pri)
 {
 
 	THREAD_LOCK_ASSERT(td, MA_OWNED);
+#ifdef DOORFS
+	/* A real sleep ends the active Door run-to-wait interval. */
+	td_get_sched(td)->ts_flags &= ~TSF_DOOR_LOCAL;
+#endif
 	td->td_slptick = ticks;
 	td_get_sched(td)->ts_slptime = 0;
 	if (pri != 0 && PRI_BASE(td->td_pri_class) == PRI_TIMESHARE)
@@ -1030,6 +1074,21 @@ sched_switch(struct thread *td, int flags)
 	td->td_lastcpu = td->td_oncpu;
 	preempted = (td->td_flags & TDF_SLICEEND) == 0 &&
 	    (flags & SW_PREEMPT) != 0;
+#ifdef DOORFS
+#ifdef SMP
+	/*
+	 * An equal-priority remote Door wake must leave the interrupted thread
+	 * behind the worker already published on this CPU's run queue.  Merely
+	 * requesting a preemption would otherwise reinsert the current thread at
+	 * the head through SRQ_PREEMPTED and can make the scheduler select it
+	 * again before servicing the Door.
+	 */
+	if (atomic_load_char(DPCPU_PTR(door_remote_handoff)) != 0) {
+		atomic_store_char(DPCPU_PTR(door_remote_handoff), 0);
+		preempted = 0;
+	}
+#endif
+#endif
 	td->td_flags &= ~TDF_SLICEEND;
 	ast_unsched_locked(td, TDA_SCHED);
 	td->td_owepreempt = 0;
@@ -1150,7 +1209,7 @@ sched_switch(struct thread *td, int flags)
 }
 
 static void
-sched_wakeup(struct thread *td, int srqflags)
+sched_4bsd_wakeup_account(struct thread *td)
 {
 	struct td_sched *ts;
 
@@ -1171,6 +1230,13 @@ sched_wakeup(struct thread *td, int srqflags)
 	if (PRI_BASE(td->td_pri_class) == PRI_ITHD &&
 	    td->td_base_pri != td->td_base_ithread_pri)
 		sched_prio(td, td->td_base_ithread_pri);
+}
+
+static void
+sched_wakeup(struct thread *td, int srqflags)
+{
+
+	sched_4bsd_wakeup_account(td);
 
 	sched_add(td, srqflags);
 }
@@ -1295,6 +1361,51 @@ kick_other_cpu(int pri, int cpuid)
 		ipi_cpu(cpuid, IPI_AST);
 	}
 }
+
+#ifdef DOORFS
+static void
+kick_other_cpu_door(struct thread *td, int cpuid)
+{
+	struct pcpu *pcpu;
+
+	mtx_assert(&sched_lock, MA_OWNED);
+	pcpu = pcpu_find(cpuid);
+
+	/* Publish the per-CPU runq insertion before sampling remote idle state. */
+	atomic_store_int(DPCPU_ID_PTR(cpuid, door_idle_hot), 1);
+	atomic_thread_fence_seq_cst();
+	if (CPU_ISSET(cpuid, &idle_cpus_mask)) {
+		/*
+		 * Keep the worker queued and record only a selection hint.
+		 * A spinning idle CPU rechecks its runq before entering idle.
+		 */
+		if (*DPCPU_ID_PTR(cpuid, door_idle_handoff) == NULL)
+			*DPCPU_ID_PTR(cpuid, door_idle_handoff) = td;
+		if (atomic_load_int(DPCPU_ID_PTR(cpuid, door_idle_spinning)) != 0)
+			return;
+
+		/* Use AST when MD idle wakeup cannot wake the CPU. */
+		forward_wakeups_delivered++;
+		if (!cpu_idle_wakeup(cpuid))
+			ipi_cpu(cpuid, IPI_AST);
+		return;
+	}
+
+	if (td->td_priority > pcpu->pc_curthread->td_priority)
+		return;
+
+	/*
+	 * A Door wake also admits equal-priority handoff.  Ask the remote
+	 * scheduler to put the interrupted thread behind the queued worker.
+	 */
+	if (pcpu->pc_curthread->td_lock == &sched_lock) {
+		pcpu->pc_curthread->td_owepreempt = 1;
+		ast_sched_locked(pcpu->pc_curthread, TDA_SCHED);
+		atomic_store_char(DPCPU_ID_PTR(cpuid, door_remote_handoff), 1);
+		ipi_cpu(cpuid, IPI_AST);
+	}
+}
+#endif /* DOORFS */
 #endif /* SMP */
 
 #ifdef SMP
@@ -1322,7 +1433,64 @@ sched_pickcpu(struct thread *td)
 
 	return (best);
 }
-#endif
+
+#ifdef DOORFS
+/*
+ * Select a concrete CPU for an unbound Door worker wakeup.  The stock
+ * 4BSD picker only compares per-CPU runq lengths, so a CPU executing a thread
+ * and an actually idle CPU both appear to have load zero.  Account for the
+ * current thread as one unit of load.  On equal load, avoid competing with
+ * the producer and its SMT sibling before considering last-CPU locality.
+ */
+static int
+sched_pickcpu_door(struct thread *td)
+{
+	struct cpu_group *cg, *smt;
+	struct pcpu *pc;
+	int best, bestcost, bestload, cost, cpu, load, producer;
+
+	mtx_assert(&sched_lock, MA_OWNED);
+	producer = PCPU_GET(cpuid);
+	smt = NULL;
+	if (cpu_top != NULL) {
+		cg = smp_topo_find(cpu_top, producer);
+		for (; cg != NULL; cg = cg->cg_parent) {
+			if ((cg->cg_flags & CG_FLAG_THREAD) != 0) {
+				smt = cg;
+				break;
+			}
+		}
+	}
+	best = NOCPU;
+	bestcost = 0;
+	bestload = 0;
+	CPU_FOREACH(cpu) {
+		if (!THREAD_CAN_SCHED(td, cpu))
+			continue;
+		pc = pcpu_find(cpu);
+		load = DPCPU_ID_GET(cpu, runq_length);
+		if (pc->pc_curthread != pc->pc_idlethread)
+			load++;
+		if (cpu == producer)
+			cost = 2;
+		else if (smt != NULL && CPU_ISSET(cpu, &smt->cg_mask))
+			cost = 1;
+		else
+			cost = 0;
+		if (best == NOCPU || load < bestload ||
+		    (load == bestload && cost < bestcost) ||
+		    (load == bestload && cost == bestcost &&
+		    cpu == td->td_lastcpu)) {
+			best = cpu;
+			bestload = load;
+			bestcost = cost;
+		}
+	}
+	KASSERT(best != NOCPU, ("no valid Door wake CPU"));
+	return (best);
+}
+#endif /* DOORFS */
+#endif /* SMP */
 
 static void
 sched_add(struct thread *td, int flags)
@@ -1373,7 +1541,12 @@ sched_add(struct thread *td, int flags)
 	 * as per-CPU state may not be initialized yet and we may crash if we
 	 * try to access the per-CPU run queues.
 	 */
-	if (smp_started && (td->td_pinned != 0 || td->td_flags & TDF_BOUND ||
+	if (smp_started && (
+#ifdef DOORFS
+	    (flags & SRQ_DOOR_WAKE) != 0 ||
+	    (ts->ts_flags & TSF_DOOR_LOCAL) != 0 ||
+#endif
+	    td->td_pinned != 0 || td->td_flags & TDF_BOUND ||
 	    ts->ts_flags & TSF_AFFINITY)) {
 		if (td->td_pinned != 0)
 			cpu = td->td_lastcpu;
@@ -1382,8 +1555,17 @@ sched_add(struct thread *td, int flags)
 			KASSERT(ts->ts_rqcpu != NOCPU,
 			    ("sched_add: bound td_sched not on cpu runq"));
 			cpu = ts->ts_rqcpu;
-		} else
-			/* Find a valid CPU for our cpuset */
+		}
+#ifdef DOORFS
+		else if ((ts->ts_flags & TSF_AFFINITY) == 0) {
+			if ((flags & SRQ_DOOR_WAKE) != 0)
+				cpu = sched_pickcpu_door(td);
+			else
+				cpu = td->td_lastcpu;
+		}
+#endif
+		else
+			/* Find a valid CPU for our cpuset. */
 			cpu = sched_pickcpu(td);
 		ts->ts_rqcpu = cpu;
 		single_cpu = 1;
@@ -1400,13 +1582,22 @@ sched_add(struct thread *td, int flags)
 
 	if ((td->td_flags & TDF_NOLOAD) == 0)
 		sched_load_add();
+#ifdef DOORFS
+	if ((flags & SRQ_DOOR_WAKE) != 0)
+		ts->ts_flags |= TSF_DOOR_LOCAL;
+#endif
 	runq_add(TS_RUNQ_PTR(ts), td, flags);
 	if (cpu != NOCPU)
 		(*DPCPU_ID_PTR(cpu, runq_length))++;
 
 	cpuid = PCPU_GET(cpuid);
 	if (single_cpu && cpu != cpuid) {
-	        kick_other_cpu(td->td_priority, cpu);
+#ifdef DOORFS
+		if ((flags & SRQ_DOOR_WAKE) != 0)
+			kick_other_cpu_door(td, cpu);
+		else
+#endif
+			kick_other_cpu(td->td_priority, cpu);
 	} else {
 		if (!single_cpu) {
 			tidlemsk = idle_cpus_mask;
@@ -1482,6 +1673,14 @@ sched_rem(struct thread *td)
 	KASSERT(TD_ON_RUNQ(td),
 	    ("sched_rem: thread not on run queue"));
 	mtx_assert(&sched_lock, MA_OWNED);
+#ifdef DOORFS
+#ifdef SMP
+	if (ts->ts_rqcpu != NOCPU &&
+	    *DPCPU_ID_PTR(ts->ts_rqcpu, door_idle_handoff) == td) {
+		*DPCPU_ID_PTR(ts->ts_rqcpu, door_idle_handoff) = NULL;
+	}
+#endif
+#endif
 	KTR_STATE2(KTR_SCHED, "thread", sched_tdname(td), "runq rem",
 	    "prio:%d", td->td_priority, KTR_ATTR_LINKED,
 	    sched_tdname(curthread));
@@ -1497,6 +1696,57 @@ sched_rem(struct thread *td)
 	TD_SET_CAN_RUN(td);
 }
 
+#ifdef DOORFS
+/* Return a validated exact successor or leave the ordinary chooser intact. */
+static struct thread *
+sched_4bsd_door_choose(void)
+{
+	struct thread *td;
+#ifdef SMP
+	struct td_sched *ts;
+#endif
+
+	mtx_assert(&sched_lock, MA_OWNED);
+	td = sched_4bsd_shuttle_choose();
+	if (__predict_false(td != NULL))
+		return (td);
+#ifdef SMP
+	/*
+	 * Fast path for a Door worker which woke this CPU from idle.  Keep the
+	 * worker on the run queue until this point, and accept the reservation
+	 * only if it is still runnable on this CPU and no better-priority thread
+	 * is waiting globally or locally.  Every failed validation falls through
+	 * to the stock chooser without changing scheduler semantics.
+	 */
+	td = *DPCPU_PTR(door_idle_handoff);
+	if (__predict_false(td != NULL)) {
+		*DPCPU_PTR(door_idle_handoff) = NULL;
+		ts = td_get_sched(td);
+		if (TD_ON_RUNQ(td) && ts->ts_rqcpu == PCPU_GET(cpuid) &&
+		    (ts->ts_flags & TSF_DOOR_LOCAL) != 0) {
+			struct thread *globaltd, *localtd;
+
+			globaltd = runq_choose(&runq_global);
+			localtd = runq_choose(DPCPU_PTR(runq_pcpu));
+			if ((globaltd == NULL ||
+			    td->td_priority <= globaltd->td_priority) &&
+			    (localtd == NULL ||
+			    td->td_priority <= localtd->td_priority)) {
+				(*DPCPU_PTR(runq_length))--;
+				runq_remove(DPCPU_PTR(runq_pcpu), td);
+				td->td_flags |= TDF_DIDRUN;
+				KASSERT(td->td_flags & TDF_INMEM,
+				    ("sched_choose: handoff thread swapped out"));
+				return (td);
+			}
+		}
+	}
+#endif
+
+	return (NULL);
+}
+#endif
+
 /*
  * Select threads to run.  Note that running threads still consume a
  * slot.
@@ -1508,6 +1758,11 @@ sched_choose(void)
 	struct runq *runq;
 
 	mtx_assert(&sched_lock,  MA_OWNED);
+#ifdef DOORFS
+	td = sched_4bsd_door_choose();
+	if (__predict_false(td != NULL))
+		return (td);
+#endif
 #ifdef SMP
 	struct thread *tdcpu;
 
@@ -1517,7 +1772,12 @@ sched_choose(void)
 
 	if (td == NULL ||
 	    (tdcpu != NULL &&
-	     tdcpu->td_priority < td->td_priority)) {
+	     (tdcpu->td_priority < td->td_priority
+#ifdef DOORFS
+	      || (tdcpu->td_priority == td->td_priority &&
+	       (td_get_sched(tdcpu)->ts_flags & TSF_DOOR_LOCAL) != 0)
+#endif
+	     ))) {
 		CTR2(KTR_RUNQ, "choosing td %p from pcpu runq %d", tdcpu,
 		     PCPU_GET(cpuid));
 		td = tdcpu;
@@ -1659,6 +1919,11 @@ static void
 sched_idletd(void *dummy)
 {
 	struct pcpuidlestat *stat;
+#ifdef DOORFS
+#ifdef SMP
+	u_int i;
+#endif
+#endif
 
 	THREAD_NO_SLEEPING();
 	stat = DPCPU_PTR(idlestat);
@@ -1666,6 +1931,31 @@ sched_idletd(void *dummy)
 		mtx_assert(&Giant, MA_NOTOWNED);
 
 		while (!sched_runnable()) {
+#ifdef DOORFS
+#ifdef SMP
+			if (door_idlespins != 0 &&
+			    atomic_load_int(DPCPU_PTR(door_idle_hot)) != 0) {
+				atomic_store_int(DPCPU_PTR(door_idle_hot), 0);
+				atomic_store_int(DPCPU_PTR(door_idle_spinning), 1);
+				/* Publish spinning before the first lockless runq check. */
+				atomic_thread_fence_seq_cst();
+				for (i = 0; i < door_idlespins; i++) {
+					if (sched_runnable())
+						break;
+					cpu_spinwait();
+				}
+				atomic_store_int(DPCPU_PTR(door_idle_spinning), 0);
+				/*
+				 * A waker which observed spinning may omit its IPI.
+				 * Recheck after withdrawing that promise and before
+				 * entering cpu_idle().
+				 */
+				atomic_thread_fence_seq_cst();
+				if (sched_runnable())
+					continue;
+			}
+#endif
+#endif
 			cpu_idle(stat->idlecalls + stat->oldidlecalls > 64);
 			stat->idlecalls++;
 		}
@@ -1838,11 +2128,644 @@ sched_affinity(struct thread *td)
 		if (td != curthread)
 			ipi_cpu(cpu, IPI_AST);
 		break;
+#ifdef DOORFS
+	case TDS_SHUTTLE:
+		/* A reserved target must be requeued under its new affinity. */
+		sched_4bsd_shuttle_cancel(td, SRQ_HOLDTD | SRQ_BORING);
+		break;
+	case TDS_SHUTTLE_WAIT:
+		/* Off-runq private waiters are placed correctly when resumed. */
+		break;
+#endif
 	default:
 		break;
 	}
 #endif
 }
+
+#ifdef DOORFS
+static inline struct sched_shuttle *
+sched_4bsd_shuttle_state(struct thread *td)
+{
+
+	return (&td_get_sched(td)->ts_shuttle);
+}
+
+/*
+ * Consume the current CPU's exact-successor reservation from the ordinary
+ * 4BSD chooser.  This keeps all context-switch accounting in
+ * sched_switch(); only selection of the next thread is overridden.
+ */
+static struct thread *
+sched_4bsd_shuttle_choose(void)
+{
+	struct sched_shuttle_token *token;
+	struct sched_shuttle *ss;
+	struct thread *peer;
+	int cpu;
+
+	mtx_assert(&sched_lock, MA_OWNED);
+	token = DPCPU_PTR(shuttle_token);
+	if ((token->sst_flags & (SCHED_SHUTTLE_TOKEN_RESERVED |
+	    SCHED_SHUTTLE_TOKEN_WAKE_RESERVED)) !=
+	    (SCHED_SHUTTLE_TOKEN_RESERVED |
+	    SCHED_SHUTTLE_TOKEN_WAKE_RESERVED) ||
+	    token->sst_cur != curthread ||
+	    token->sst_cpu != PCPU_GET(cpuid))
+		return (NULL);
+
+	peer = token->sst_peer;
+	cpu = PCPU_GET(cpuid);
+	ss = peer != NULL ? sched_4bsd_shuttle_state(peer) : NULL;
+	if (peer == NULL || peer->td_lock != &sched_lock ||
+	    !TD_IS_SHUTTLE(peer) || ss->ss_state != SCHED_SHUTTLE_RESUMING ||
+	    ss->ss_peer != curthread ||
+	    ss->ss_generation != token->sst_generation ||
+	    !THREAD_CAN_SCHED(peer, cpu)) {
+		sched_4bsd_shuttle_restore_locked(token);
+		return (NULL);
+	}
+#ifdef SMP
+	if ((peer->td_pinned != 0 || (peer->td_flags & TDF_BOUND) != 0) &&
+	    td_get_sched(peer)->ts_rqcpu != cpu) {
+		sched_4bsd_shuttle_restore_locked(token);
+		return (NULL);
+	}
+#endif
+
+	/* The parked target was not included in sched_tdcnt. */
+	TD_SET_CAN_RUN(peer);
+	sched_4bsd_wakeup_account(peer);
+	if ((peer->td_flags & TDF_NOLOAD) == 0)
+		sched_load_add();
+	bzero(token, sizeof(*token));
+	return (peer);
+}
+
+static void
+sched_4bsd_shuttle_restore_locked(struct sched_shuttle_token *token)
+{
+	struct thread *peer;
+
+	mtx_assert(&sched_lock, MA_OWNED);
+	if (token == NULL ||
+	    (token->sst_flags & SCHED_SHUTTLE_TOKEN_RESERVED) == 0)
+		return;
+	peer = token->sst_peer;
+	KASSERT(peer != NULL && peer->td_lock == &sched_lock,
+	    ("4bsd shuttle restore lost scheduler ownership"));
+	bzero(token, sizeof(*token));
+	if (TD_IS_SHUTTLE(peer)) {
+		TD_SET_CAN_RUN(peer);
+		sched_wakeup(peer, SRQ_HOLDTD | SRQ_BORING);
+	}
+}
+
+/*
+ * 4BSD shuttle protocol.  Private waiters remain outside the sleep queue and
+ * an already parked waiter may be reserved as the current CPU's exact next
+ * thread.  The ordinary 4BSD switch performs accounting; its chooser consumes
+ * the reservation under sched_lock.
+ */
+static enum sched_shuttle_result
+sched_4bsd_shuttle_prepare(struct thread *td, struct thread *peer,
+    const void *wchan, int flags)
+{
+	struct sched_shuttle *ss;
+
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	if (wchan == NULL || peer == NULL || peer == td)
+		return (SCHED_SHUTTLE_ABORTED);
+
+	ss = sched_4bsd_shuttle_state(td);
+	if (ss->ss_state != SCHED_SHUTTLE_NONE)
+		return (SCHED_SHUTTLE_RETRY);
+
+	ss->ss_peer = peer;
+	ss->ss_wchan = wchan;
+	ss->ss_flags = flags;
+	ss->ss_pending = 0;
+	ss->ss_generation++;
+	ss->ss_state = SCHED_SHUTTLE_PREPARED;
+	return (SCHED_SHUTTLE_OK);
+}
+
+static enum sched_shuttle_result
+sched_4bsd_shuttle_commit(struct thread *td, int flags)
+{
+	struct sched_shuttle *ss;
+
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	KASSERT(td == curthread, ("shuttle commit for non-current thread"));
+	KASSERT(TD_IS_SLEEPING(td),
+	    ("shuttle commit for non-sleeping thread %p", td));
+
+	ss = sched_4bsd_shuttle_state(td);
+	if (ss->ss_state != SCHED_SHUTTLE_PREPARED)
+		return (SCHED_SHUTTLE_FALLBACK);
+	ss->ss_flags |= flags;
+	if (ss->ss_pending != 0)
+		return (SCHED_SHUTTLE_ABORTED);
+	if (!TD_ON_SLEEPQ(td) || td->td_wchan != ss->ss_wchan)
+		return (SCHED_SHUTTLE_ABORTED);
+	ss->ss_state = SCHED_SHUTTLE_COMMITTED;
+	return (SCHED_SHUTTLE_OK);
+}
+
+static enum sched_shuttle_result
+sched_4bsd_shuttle_resume(struct thread *td, int flags)
+{
+	struct sched_shuttle *ss;
+	const void *wchan;
+	enum sched_shuttle_result result;
+
+	thread_lock(td);
+	ss = sched_4bsd_shuttle_state(td);
+	if (ss->ss_state == SCHED_SHUTTLE_PREPARED ||
+	    ss->ss_state == SCHED_SHUTTLE_COMMITTED) {
+		ss->ss_flags |= flags;
+		ss->ss_pending = 1;
+		thread_unlock(td);
+		return (SCHED_SHUTTLE_RETRY);
+	}
+	if ((flags & SCHED_SHUTTLE_F_ASYNC_WAKE) != 0 &&
+	    TD_IS_SHUTTLE_WAIT(td) &&
+	    ss->ss_state == SCHED_SHUTTLE_SLEEPING) {
+		ss->ss_peer = NULL;
+		ss->ss_wchan = NULL;
+		ss->ss_flags = 0;
+		ss->ss_pending = 0;
+		ss->ss_state = SCHED_SHUTTLE_NONE;
+		ss->ss_generation++;
+		TD_SET_CAN_RUN(td);
+		sched_4bsd_shuttle_wakeup_async(td);
+		return (SCHED_SHUTTLE_OK);
+	}
+	if (TD_IS_SHUTTLE_WAIT(td) &&
+	    ss->ss_state == SCHED_SHUTTLE_SLEEPING) {
+		ss->ss_flags |= flags;
+		ss->ss_state = SCHED_SHUTTLE_RESUMING;
+		TD_SET_CAN_RUN(td);
+		result = sched_4bsd_shuttle_wakeup(td, flags);
+		if (result == SCHED_SHUTTLE_OK)
+			return (SCHED_SHUTTLE_OK);
+		ss = sched_4bsd_shuttle_state(td);
+		ss->ss_peer = NULL;
+		ss->ss_wchan = NULL;
+		ss->ss_flags = 0;
+		ss->ss_pending = 0;
+		ss->ss_state = SCHED_SHUTTLE_NONE;
+		ss->ss_generation++;
+		sched_wakeup(td, SRQ_DOOR_WAKE);
+		return (SCHED_SHUTTLE_OK);
+	}
+	if ((ss->ss_state != SCHED_SHUTTLE_COMMITTED &&
+	    ss->ss_state != SCHED_SHUTTLE_SLEEPING) ||
+	    ss->ss_wchan == NULL || !TD_ON_SLEEPQ(td)) {
+		thread_unlock(td);
+		return (SCHED_SHUTTLE_ABORTED);
+	}
+
+	ss->ss_flags |= flags;
+	ss->ss_state = SCHED_SHUTTLE_RESUMING;
+	wchan = ss->ss_wchan;
+	thread_unlock(td);
+	sleepq_remove(td, wchan);
+
+	thread_lock(td);
+	ss = sched_4bsd_shuttle_state(td);
+	if (ss->ss_state == SCHED_SHUTTLE_RESUMING) {
+		ss->ss_wchan = NULL;
+		ss->ss_pending = 0;
+		ss->ss_state = SCHED_SHUTTLE_NONE;
+		ss->ss_generation++;
+	}
+	thread_unlock(td);
+	return (SCHED_SHUTTLE_OK);
+}
+
+static enum sched_shuttle_result
+sched_4bsd_shuttle_dispatch(struct thread *td, struct thread *peer,
+    const void *wchan, int flags)
+{
+	struct sched_shuttle *ss;
+
+	if (td == NULL || peer == NULL || peer != curthread || peer == td ||
+	    wchan == NULL)
+		return (SCHED_SHUTTLE_ABORTED);
+
+	thread_lock(td);
+	ss = sched_4bsd_shuttle_state(td);
+	if ((ss->ss_flags & SCHED_SHUTTLE_F_IDLE_WAIT) == 0 ||
+	    ss->ss_peer != NULL || ss->ss_wchan != wchan) {
+		thread_unlock(td);
+		return (SCHED_SHUTTLE_FALLBACK);
+	}
+	if (ss->ss_state == SCHED_SHUTTLE_PREPARED) {
+		ss->ss_peer = peer;
+		ss->ss_flags |= flags;
+		ss->ss_pending = 1;
+		thread_unlock(td);
+		return (SCHED_SHUTTLE_OK);
+	}
+	thread_unlock(td);
+	return (sched_4bsd_shuttle_resume_to(td, peer, flags));
+}
+
+static enum sched_shuttle_result
+sched_4bsd_shuttle_sleep(struct thread *td, struct thread *peer,
+    const void *wchan, int flags)
+{
+	struct sched_shuttle *ss;
+
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	if (td != curthread || !TD_IS_RUNNING(td) || wchan == NULL ||
+	    peer == td ||
+	    (peer != NULL && (flags & SCHED_SHUTTLE_F_IDLE_WAIT) != 0))
+		return (SCHED_SHUTTLE_ABORTED);
+	ss = sched_4bsd_shuttle_state(td);
+	if (ss->ss_state != SCHED_SHUTTLE_NONE)
+		return (SCHED_SHUTTLE_RETRY);
+	ss->ss_peer = peer;
+	ss->ss_wchan = wchan;
+	ss->ss_flags = flags;
+	ss->ss_pending = 0;
+	ss->ss_state = SCHED_SHUTTLE_PREPARED;
+	ss->ss_generation++;
+	return (SCHED_SHUTTLE_OK);
+}
+
+static enum sched_shuttle_result
+sched_4bsd_shuttle_resume_to(struct thread *td, struct thread *owner,
+    int flags)
+{
+	struct sched_shuttle *ss;
+	enum sched_shuttle_result result;
+
+	if (td == NULL || owner == NULL || owner != curthread || td == owner)
+		return (SCHED_SHUTTLE_ABORTED);
+	thread_lock(td);
+	ss = sched_4bsd_shuttle_state(td);
+	if (ss->ss_peer == NULL) {
+		if ((ss->ss_flags & SCHED_SHUTTLE_F_IDLE_WAIT) == 0) {
+			thread_unlock(td);
+			return (SCHED_SHUTTLE_FALLBACK);
+		}
+		ss->ss_peer = owner;
+	} else if (ss->ss_peer != owner) {
+		thread_unlock(td);
+		return (SCHED_SHUTTLE_FALLBACK);
+	}
+
+	if (ss->ss_state == SCHED_SHUTTLE_PREPARED ||
+	    ss->ss_state == SCHED_SHUTTLE_COMMITTED) {
+		ss->ss_flags |= flags;
+		ss->ss_pending = 1;
+		thread_unlock(td);
+		return (SCHED_SHUTTLE_RETRY);
+	}
+	if (!TD_IS_SHUTTLE_WAIT(td) ||
+	    ss->ss_state != SCHED_SHUTTLE_SLEEPING) {
+		if ((ss->ss_flags & SCHED_SHUTTLE_F_IDLE_WAIT) != 0)
+			ss->ss_peer = NULL;
+		thread_unlock(td);
+		return (SCHED_SHUTTLE_FALLBACK);
+	}
+
+	ss->ss_flags |= flags;
+	if ((flags & SCHED_SHUTTLE_F_ASYNC_WAKE) != 0) {
+		ss->ss_peer = NULL;
+		ss->ss_wchan = NULL;
+		ss->ss_flags = 0;
+		ss->ss_pending = 0;
+		ss->ss_state = SCHED_SHUTTLE_NONE;
+		ss->ss_generation++;
+		TD_SET_CAN_RUN(td);
+		sched_4bsd_shuttle_wakeup_async(td);
+		return (SCHED_SHUTTLE_OK);
+	}
+
+	ss->ss_state = SCHED_SHUTTLE_RESUMING;
+	TD_SET_CAN_RUN(td);
+	result = sched_4bsd_shuttle_wakeup(td, flags);
+	if (result == SCHED_SHUTTLE_OK)
+		return (SCHED_SHUTTLE_OK);
+
+	/* Reservation missed; publish the waiter through the normal run queue. */
+	ss = sched_4bsd_shuttle_state(td);
+	ss->ss_peer = NULL;
+	ss->ss_wchan = NULL;
+	ss->ss_flags = 0;
+	ss->ss_pending = 0;
+	ss->ss_state = SCHED_SHUTTLE_NONE;
+	ss->ss_generation++;
+	sched_wakeup(td, SRQ_DOOR_WAKE);
+	return (SCHED_SHUTTLE_FALLBACK);
+}
+
+static enum sched_shuttle_result
+sched_4bsd_shuttle_swtch(struct thread *td, int flags)
+{
+	struct sched_shuttle *ss;
+	enum sched_shuttle_result result;
+
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	if (td != curthread)
+		return (SCHED_SHUTTLE_FALLBACK);
+	ss = sched_4bsd_shuttle_state(td);
+	if (ss->ss_state == SCHED_SHUTTLE_PREPARED) {
+		result = sched_4bsd_shuttle_park(td, flags);
+		if (result != SCHED_SHUTTLE_OK) {
+			if (result == SCHED_SHUTTLE_ABORTED &&
+			    ss->ss_state == SCHED_SHUTTLE_PREPARED)
+				sched_4bsd_shuttle_abort(td);
+			KASSERT(result != SCHED_SHUTTLE_ABORTED ||
+			    ss->ss_state != SCHED_SHUTTLE_PREPARED,
+			    ("shuttle abort left PREPARED intent"));
+			return (result);
+		}
+	}
+	if (!TD_IS_SHUTTLE_WAIT(td))
+		return (SCHED_SHUTTLE_FALLBACK);
+	return (sched_4bsd_shuttle_switch(td, flags));
+}
+
+static enum sched_shuttle_result
+sched_4bsd_shuttle_wakeup(struct thread *td, int flags)
+{
+	struct sched_shuttle_token *token;
+	struct sched_shuttle *ss;
+	struct td_sched *ts;
+	int cpu;
+
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	if (__predict_false(KERNEL_PANICKED()) || !TD_CAN_RUN(td)) {
+		return (SCHED_SHUTTLE_FALLBACK);
+	}
+	/* An asynchronous waker cannot own an exact-successor reservation. */
+	if ((flags & SCHED_SHUTTLE_F_ASYNC_WAKE) != 0) {
+		return (SCHED_SHUTTLE_FALLBACK);
+	}
+	ss = sched_4bsd_shuttle_state(td);
+	if (ss->ss_state != SCHED_SHUTTLE_RESUMING ||
+	    ss->ss_peer != curthread) {
+		return (SCHED_SHUTTLE_FALLBACK);
+	}
+
+	cpu = PCPU_GET(cpuid);
+	ts = td_get_sched(td);
+	if (!THREAD_CAN_SCHED(td, cpu)) {
+		return (SCHED_SHUTTLE_FALLBACK);
+	}
+#ifdef SMP
+	if ((td->td_pinned != 0 || (td->td_flags & TDF_BOUND) != 0) &&
+	    ts->ts_rqcpu != cpu) {
+		return (SCHED_SHUTTLE_FALLBACK);
+	}
+#else
+	(void)ts;
+#endif
+
+	/* Move the private waiter into the global 4BSD scheduler lock domain. */
+	if (td->td_lock != &sched_lock) {
+		mtx_lock_spin(&sched_lock);
+		thread_lock_set(td, &sched_lock);
+	}
+	token = DPCPU_PTR(shuttle_token);
+	if ((token->sst_flags & SCHED_SHUTTLE_TOKEN_RESERVED) != 0) {
+		return (SCHED_SHUTTLE_FALLBACK);
+	}
+
+	TD_SET_SHUTTLE(td);
+	bzero(token, sizeof(*token));
+	token->sst_cur = curthread;
+	token->sst_peer = td;
+	token->sst_candidate = td;
+	token->sst_sched_data = &sched_lock;
+	token->sst_generation = ss->ss_generation;
+	token->sst_flags = SCHED_SHUTTLE_TOKEN_VALIDATED |
+	    SCHED_SHUTTLE_TOKEN_LOCAL | SCHED_SHUTTLE_TOKEN_RESERVED |
+	    SCHED_SHUTTLE_TOKEN_WAKE_RESERVED;
+	token->sst_cpu = cpu;
+	token->sst_rqindex = -1;
+	token->sst_xferable = false;
+	mtx_unlock_spin(&sched_lock);
+	return (SCHED_SHUTTLE_OK);
+}
+
+/*
+ * Publish an asynchronous shuttle waiter through the ordinary 4BSD run
+ * queue.  maybe_resched() deliberately ignores an equal-priority thread.
+ * That is normally correct, but lets a same-CPU ONEWAY producer retain its
+ * whole quantum while the only Door worker waits on that CPU.  Since the
+ * producer returns to userspace instead of entering mi_switch_shuttle(), ask
+ * a real scheduler AST to choose again after a local enqueue.
+ *
+ * SRQ_HOLDTD keeps the scheduler lock stable long enough to inspect the
+ * selected run queue.  An unbound Door worker has already been assigned a
+ * concrete CPU by sched_pickcpu_door().  Remote targets are handled by the
+ * Door-aware kick_other_cpu() path and do not reschedule this CPU.
+ */
+static void
+sched_4bsd_shuttle_wakeup_async(struct thread *td)
+{
+#ifdef SMP
+	struct td_sched *ts;
+	int cpu;
+#endif
+
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	sched_wakeup(td, SRQ_HOLDTD | SRQ_DOOR_WAKE);
+
+#ifdef SMP
+	ts = td_get_sched(td);
+	cpu = PCPU_GET(cpuid);
+	if (ts->ts_rqcpu == cpu || ts->ts_rqcpu == NOCPU)
+		ast_sched_locked(curthread, TDA_SCHED);
+#else
+	ast_sched_locked(curthread, TDA_SCHED);
+#endif
+	thread_unlock(td);
+}
+
+static void
+sched_4bsd_shuttle_cancel(struct thread *td, int srqflags)
+{
+	struct sched_shuttle_token *token;
+	int cpu;
+
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	if (TD_IS_SHUTTLE_WAIT(td)) {
+		sched_4bsd_shuttle_unpark(td, srqflags);
+		return;
+	}
+	KASSERT(TD_IS_SHUTTLE(td),
+	    ("4bsd shuttle cancel: td %p state %d", td, TD_GET_STATE(td)));
+	KASSERT(td->td_lock == &sched_lock,
+	    ("4bsd shuttle cancel without sched_lock ownership"));
+	token = NULL;
+	CPU_FOREACH(cpu) {
+		struct sched_shuttle_token *candidate;
+
+		candidate = DPCPU_ID_PTR(cpu, shuttle_token);
+		if ((candidate->sst_flags & SCHED_SHUTTLE_TOKEN_RESERVED) != 0 &&
+		    candidate->sst_peer == td) {
+			token = candidate;
+			break;
+		}
+	}
+	KASSERT(token != NULL,
+	    ("4bsd shuttle target %p has no reservation", td));
+	if (token != NULL)
+		bzero(token, sizeof(*token));
+	TD_SET_CAN_RUN(td);
+	sched_wakeup(td, srqflags);
+}
+
+static void
+sched_4bsd_shuttle_unpark(struct thread *td, int srqflags)
+{
+
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	KASSERT(TD_IS_SHUTTLE_WAIT(td),
+	    ("4bsd shuttle unpark: td %p state %d", td, TD_GET_STATE(td)));
+
+	/* Preserve interruptible-wait state; the resumed target owns cleanup. */
+	TD_SET_CAN_RUN(td);
+	sched_wakeup(td, srqflags);
+}
+
+
+static enum sched_shuttle_result
+sched_4bsd_shuttle_park(struct thread *td, int flags)
+{
+	struct sched_shuttle *ss;
+
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	KASSERT(td == curthread, ("shuttle park for non-current thread"));
+	if (!TD_IS_RUNNING(td))
+		return (SCHED_SHUTTLE_FALLBACK);
+	ss = sched_4bsd_shuttle_state(td);
+	if (ss->ss_state != SCHED_SHUTTLE_PREPARED)
+		return (SCHED_SHUTTLE_FALLBACK);
+	ss->ss_flags |= flags;
+	if (ss->ss_pending != 0)
+		return (SCHED_SHUTTLE_ABORTED);
+	/*
+	 * Close the running-to-wait signal race.  The earlier Door-side AST
+	 * check is necessarily performed before thread_lock(td), so a signal
+	 * may become pending after that check while the thread is still running.
+	 * In that state tdsigwakeup() only posts the AST; it cannot unpark a
+	 * waiter which has not yet published TDS_SHUTTLE_WAIT.  Recheck under
+	 * td_lock immediately before publishing the private wait.  A later
+	 * signal must acquire the same lock and will therefore observe
+	 * TDS_SHUTTLE_WAIT together with TDF_SINTR and unpark it normally.
+	 */
+	if ((flags & SCHED_SHUTTLE_F_INTERRUPTIBLE) != 0 &&
+	    ((td->td_pflags & TDP_WAKEUP) != 0 ||
+	    td_ast_pending(td, TDA_SIG) ||
+	    td_ast_pending(td, TDA_SUSPEND)))
+		return (SCHED_SHUTTLE_ABORTED);
+	sched_sleep(td, 0);
+	if ((flags & SCHED_SHUTTLE_F_INTERRUPTIBLE) != 0) {
+		td->td_flags |= TDF_SINTR;
+		td->td_intrval = 0;
+	}
+	TD_SET_SHUTTLE_WAIT(td);
+	ss->ss_state = SCHED_SHUTTLE_COMMITTED;
+	return (SCHED_SHUTTLE_OK);
+}
+
+static enum sched_shuttle_result
+sched_4bsd_shuttle_switch(struct thread *td, int flags)
+{
+	struct sched_shuttle *ss;
+
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	KASSERT(td == curthread, ("shuttle switch for non-current thread"));
+	KASSERT(TD_IS_SLEEPING(td) || TD_IS_SHUTTLE_WAIT(td),
+	    ("shuttle switch for non-blocked thread %p", td));
+
+	ss = sched_4bsd_shuttle_state(td);
+	if (ss->ss_state != SCHED_SHUTTLE_COMMITTED)
+		return (SCHED_SHUTTLE_FALLBACK);
+	if (ss->ss_pending != 0) {
+		if (TD_IS_SHUTTLE_WAIT(td))
+			TD_SET_RUNNING(td);
+		sched_4bsd_shuttle_abort(td);
+		return (SCHED_SHUTTLE_ABORTED);
+	}
+
+	ss->ss_flags |= flags;
+	ss->ss_state = SCHED_SHUTTLE_SLEEPING;
+
+	mi_switch_shuttle(SW_VOL | SWT_SHUTTLE);
+
+	thread_lock(td);
+	ss = sched_4bsd_shuttle_state(td);
+	ss->ss_peer = NULL;
+	ss->ss_wchan = NULL;
+	ss->ss_flags = 0;
+	ss->ss_pending = 0;
+	ss->ss_state = SCHED_SHUTTLE_NONE;
+	ss->ss_generation++;
+	thread_unlock(td);
+	return (SCHED_SHUTTLE_OK);
+}
+
+
+
+
+
+static void
+sched_4bsd_shuttle_abort(struct thread *td)
+{
+	struct sched_shuttle_token *token;
+	struct sched_shuttle *ss;
+	struct mtx *old;
+
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	ss = sched_4bsd_shuttle_state(td);
+	ss->ss_peer = NULL;
+	ss->ss_wchan = NULL;
+	ss->ss_flags = 0;
+	ss->ss_pending = 0;
+	ss->ss_state = SCHED_SHUTTLE_NONE;
+	ss->ss_generation++;
+
+	/*
+	 * An early wake can leave current owning a reservation for another
+	 * waiter while current itself aborts its pending sleep.  Move current
+	 * back to the 4BSD scheduler lock and publish that reserved target
+	 * normally so it cannot be stranded outside every run queue.
+	 */
+	if (td == curthread && TD_IS_RUNNING(td)) {
+		if (td->td_lock != &sched_lock) {
+			old = thread_lock_block(td);
+			spinlock_enter();
+			mtx_unlock_spin(old);
+			mtx_lock_spin(&sched_lock);
+			thread_lock_unblock(td, &sched_lock);
+			spinlock_exit();
+		}
+		token = DPCPU_PTR(shuttle_token);
+		if ((token->sst_flags & (SCHED_SHUTTLE_TOKEN_RESERVED |
+		    SCHED_SHUTTLE_TOKEN_WAKE_RESERVED)) ==
+		    (SCHED_SHUTTLE_TOKEN_RESERVED |
+		    SCHED_SHUTTLE_TOKEN_WAKE_RESERVED) &&
+		    token->sst_cur == td)
+			sched_4bsd_shuttle_restore_locked(token);
+	}
+}
+
+static void
+sched_4bsd_shuttle_sswitch(struct thread *td, int flags)
+{
+
+	/* The ordinary chooser consumes the current CPU's exact reservation. */
+	sched_switch(td, flags);
+}
+#endif /* DOORFS */
 
 static int
 sched_find_l2_neighbor(int cpu)

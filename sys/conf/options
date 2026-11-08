@@ -283,6 +283,12 @@ UNIONFS		opt_dontuse.h
 ZFS		opt_dontuse.h
 P9FS		opt_dontuse.h
 
+# Doors IPC
+DOORFS		opt_doorfs.h
+DOORFS_TEST	opt_doorfs.h
+NAMEFS		opt_dontuse.h
+DOORCTL		opt_doorctl.h
+
 # Pseudofs debugging
 PSEUDOFS_TRACE	opt_pseudofs.h
 

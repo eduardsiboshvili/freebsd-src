@@ -1,0 +1,179 @@
+.Dd October 26, 2026
+.Dt DOOR_SHM_PAIR 3
+.Os
+.Sh NAME
+.Nm door_shm_pair_create ,
+.Nm door_shm_pair_attach ,
+.Nm door_shm_pair_load ,
+.Nm door_shm_pair_notify ,
+.Nm door_shm_pair_wait ,
+.Nm door_shm_pool_create ,
+.Nm door_shm_pool_region ,
+.Nm door_shm_pool_reserve ,
+.Nm door_shm_pool_release ,
+.Nm door_shm_pool_destroy ,
+.Nm door_shm_chain_map
+.Nd paired SHM events and variable-length allocation chains
+.Sh LIBRARY
+.Lb libdoor
+.Sh SYNOPSIS
+.In sys/uio.h
+.In door.h
+.Ft int
+.Fn door_shm_pair_create "int fd" "size_t size" "door_shm_t *shm"
+.Ft int
+.Fn door_shm_pair_attach "int fd" "door_shm_id_t region" "door_shm_t *shm"
+.Ft int
+.Fn door_shm_pair_load "const door_shm_t *shm" "uint_t lane" "uint32_t *value"
+.Ft int
+.Fn door_shm_pair_notify "const door_shm_t *shm" "uint_t lane"
+.Ft int
+.Fn door_shm_pair_wait "const door_shm_t *shm" "uint_t lane" "uint32_t expected" "uint64_t timeout_ns"
+.Ft int
+.Fn door_shm_pool_create "int fd" "size_t bytes" "uint_t max_leases" "door_shm_pool_t **pool"
+.Ft "const door_shm_t *"
+.Fn door_shm_pool_region "const door_shm_pool_t *pool"
+.Ft int
+.Fn door_shm_pool_reserve "door_shm_pool_t *pool" "size_t bytes" "door_shm_chain_t *chain"
+.Ft int
+.Fn door_shm_pool_release "door_shm_pool_t *pool" "const door_shm_chain_t *chain"
+.Ft int
+.Fn door_shm_pool_destroy "door_shm_pool_t *pool"
+.Ft int
+.Fn door_shm_chain_map "const door_shm_t *shm" "const door_shm_chain_t *chain" "struct iovec *iov" "uint_t capacity"
+.Sh DESCRIPTION
+These optional interfaces extend persistent Door SHM.
+They do not alter CALL, ONEWAY, native async, ring, or page-view contracts.
+.Pp
+A pair region reserves its first VM page for control information.
+Two aligned 32-bit sequence words occupy offsets 0 and 64.
+Lanes 0 and 1 are independent application-defined events.
+The creator and the Door owner may share the region; a third process cannot
+attach or operate on its wait queues merely by knowing the region id.
+Fork-inherited mappings remain inherited mappings; this interface does not
+remove memory access deliberately inherited through
+.Xr fork 2 .
+.Pp
+.Fn door_shm_pair_create
+requires read/write memory and at least one VM page.
+.Fn door_shm_pair_attach
+requires the calling process to own the Door and requests read/write access.
+Use
+.Fn door_shm_destroy_handle
+followed by
+.Fn door_shm_unmap
+to clean up a directly created pair region.
+An attached peer only unmaps its local handle.
+.Pp
+.Fn door_shm_pair_load
+performs an acquire load without entering the kernel.
+.Fn door_shm_pair_notify
+increments a sequence with release ordering, then enters the kernel to wake
+all waiters for that region and lane.
+Notify once per published batch, after publishing the actual queue predicate.
+A failed wake does not undo the shared sequence increment.
+.Pp
+.Fn door_shm_pair_wait
+returns immediately if the sequence has changed.
+Otherwise the kernel rechecks the wired VM-object word while registering an
+interruptible wait under the same lock used by wake and invalidation.
+The timeout is relative, in nanoseconds; zero polls and
+.Dv DOOR_SHM_PAIR_FOREVER
+waits indefinitely.
+Finite values are limited to one day.
+Spurious wakes do not extend the original deadline.
+Success means the event sequence changed; it does not mean a request completed.
+A memory-only mismatch may succeed after revoke because it does not inspect
+kernel state.
+.Pp
+The caller must load the sequence before rechecking its empty-queue or
+no-free-space predicate, then wait only if that predicate still holds.
+Sequence words must not be reset while participants are active.
+A complete 32-bit wrap between observation and wait can cause ABA; applications
+must bound that interval or change their higher-level generation.
+.Pp
+Destroy, Door revoke, or exit/exec of a participant invalidates the pair and
+wakes its registered waiters.
+Retained mappings are not forcibly removed.
+Unmap only after joining local users of those mappings.
+.Sh ALLOCATION CHAINS
+.Fn door_shm_pool_create
+creates a pair region with at least
+.Fa bytes
+payload bytes, rounded to 64 bytes, plus one control page.
+The number of simultaneous leases is explicitly bounded by
+.Fa max_leases
+in the range 1 through 4096.
+Allocation metadata and the mutex reside in the creator's private memory.
+The returned pool is process-local and cannot be reused after fork.
+.Pp
+.Fn door_shm_pool_region
+returns a borrowed handle for registration, attachment and event operations.
+Do not destroy or unmap this borrowed handle independently.
+.Fn door_shm_pool_reserve
+returns a variable-length chain containing at most 64 offset/length segments.
+No payload is copied.
+Failure consumes neither memory nor a lease.
+.Pp
+.Fn door_shm_chain_map
+validates a local snapshot of the descriptor and produces process-local
+.Vt "struct iovec"
+entries.
+It rejects wrong region/generation, overlap, control-page access, invalid
+counts, overflow, or an inconsistent total length.
+It does not authenticate the lease against the producer's private allocator
+or prove that the producer has not released it.
+The surrounding protocol must provide publication and a final-access
+acknowledgement before reuse.
+.Pp
+.Fn door_shm_pool_release
+requires the exact issued descriptor, clears its rounded payload extents,
+returns the extents to the allocator, and coalesces adjacent free space.
+Old or modified descriptors cannot free a different lease.
+Clearing is a memory-bandwidth cost; zero-copy does not mean zero stores.
+.Pp
+Reserve and release are serialized within a pool and support multiple threads.
+Destroy requires exclusive local access after joining all local users and
+returns
+.Er EBUSY
+while leases remain.
+There is no automatic release on cancellation or timeout: a peer might still
+be accessing the payload.
+.Pp
+This first interface provides neither an ordered descriptor queue, kqueue
+readiness, an inter-channel global allocator, nor mirrored VA mappings.
+The application supplies its descriptor-publication protocol.
+.Sh RETURN VALUES
+Integer functions return zero on success and -1 with
+.Va errno
+on error.
+.Fn door_shm_pool_region
+returns NULL on error.
+.Sh ERRORS
+.Bl -tag -width ETIMEDOUT
+.It Bq Er EAGAIN
+Insufficient free payload, excessive fragmentation, or no free lease.
+.It Bq Er ENOSPC
+A Door SHM quota or the global 1024-pair control-page budget is exhausted.
+.It Bq Er EBUSY
+Destroy attempted while leases remain, or an incompatible SHM operation.
+.It Bq Er ESTALE
+A release descriptor is old, unknown, or modified.
+.It Bq Er ETIMEDOUT
+The sequence did not change before the wait deadline.
+.It Bq Er EINTR
+An interruptible wait was interrupted by a signal.
+.It Bq Er ENOENT
+The region was destroyed or invalidated by participant exit/exec.
+.It Bq Er EBADF
+The Door was revoked or its capability is invalid.
+.It Bq Er EPERM
+The process is not a registered participant or is using an inherited allocator.
+.It Bq Er EINVAL
+An argument, descriptor, flags, lane, or timeout is invalid.
+.It Bq Er EOVERFLOW
+A requested size or allocation generation cannot be represented.
+.El
+.Sh SEE ALSO
+.Xr door 3 ,
+.Xr doorfs 4

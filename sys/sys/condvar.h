@@ -45,6 +45,8 @@ struct cv {
 
 struct lock_object;
 
+struct thread;
+
 void	cv_init(struct cv *cvp, const char *desc);
 void	cv_destroy(struct cv *cvp);
 
@@ -52,6 +54,14 @@ void	_cv_wait(struct cv *cvp, struct lock_object *lock);
 void	_cv_wait_unlock(struct cv *cvp, struct lock_object *lock);
 int	_cv_wait_sig(struct cv *cvp, struct lock_object *lock);
 int	_cv_wait_sig_unlock(struct cv *cvp, struct lock_object *lock);
+
+int	_cv_wait_shuttle(struct cv *cvp, struct lock_object *lock,
+	    struct thread *peer, struct thread *dispatch_td,
+	    struct cv *dispatch_cvp, int shuttle_flags);
+int	_cv_wait_sig_shuttle(struct cv *cvp, struct lock_object *lock,
+	    struct thread *peer, struct thread *dispatch_td,
+	    struct cv *dispatch_cvp, int shuttle_flags);
+
 int	_cv_timedwait_sbt(struct cv *cvp, struct lock_object *lock,
 	    sbintime_t sbt, sbintime_t pr, int flags);
 int	_cv_timedwait_sig_sbt(struct cv *cvp, struct lock_object *lock,
@@ -68,6 +78,14 @@ void	cv_broadcastpri(struct cv *cvp, int pri);
 	_cv_wait_sig((cvp), &(lock)->lock_object)
 #define	cv_wait_sig_unlock(cvp, lock)					\
 	_cv_wait_sig_unlock((cvp), &(lock)->lock_object)
+
+#define	cv_wait_shuttle(cvp, lock, peer, dispatch_td, dispatch_cvp, flags) \
+	_cv_wait_shuttle((cvp), &(lock)->lock_object, (peer), (dispatch_td), \
+	    (dispatch_cvp), (flags))
+#define	cv_wait_sig_shuttle(cvp, lock, peer, dispatch_td, dispatch_cvp, flags) \
+	_cv_wait_sig_shuttle((cvp), &(lock)->lock_object, (peer), \
+	    (dispatch_td), (dispatch_cvp), (flags))
+
 #define	cv_timedwait(cvp, lock, timo)					\
 	_cv_timedwait_sbt((cvp), &(lock)->lock_object,			\
 	    tick_sbt * (timo), 0, C_HARDCLOCK)

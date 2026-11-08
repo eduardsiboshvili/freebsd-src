@@ -52,6 +52,7 @@ SUBDIR=	${SUBDIR_BOOTSTRAP} \
 	libdevinfo \
 	libdevstat \
 	libdl \
+	libdoor \
 	libdwarf \
 	libedit \
 	libelftc \
@@ -134,6 +135,7 @@ SUBDIR_DEPEND_libcam= libsbuf
 SUBDIR_DEPEND_libcasper= libnv
 SUBDIR_DEPEND_libcrypt= libmd
 SUBDIR_DEPEND_libdevstat= libkvm
+SUBDIR_DEPEND_libdoor= libthr
 SUBDIR_DEPEND_libedit= ncurses
 SUBDIR_DEPEND_libgeom= libexpat libsbuf
 .if ${MK_MITKRB5} == "no"

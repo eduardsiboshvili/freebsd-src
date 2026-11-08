@@ -62,6 +62,7 @@
 #include "opt_ddb.h"
 #include "opt_sched.h"
 #include "opt_stack.h"
+#include "opt_doorfs.h"
 
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -296,6 +297,20 @@ sleepq_release(const void *wchan)
 	sc = SC_LOOKUP(wchan);
 	mtx_unlock_spin(&sc->sc_lock);
 }
+
+#ifdef DOORFS
+/*
+ * Return true when two wait channels hash to the same sleepqueue chain.
+ * Used by the fused shuttle/CV wait to avoid recursively taking one chain
+ * lock while dispatching an exact peer sleeping on another CV.
+ */
+bool
+sleepq_same_chain(const void *wchan1, const void *wchan2)
+{
+
+	return (SC_LOOKUP(wchan1) == SC_LOOKUP(wchan2));
+}
+#endif
 
 /*
  * Places the current thread on the sleep queue for the specified wait
@@ -537,6 +552,29 @@ sleepq_catch_signals(const void *wchan, int pri)
 	return (ret);
 }
 
+#ifdef DOORFS
+/*
+ * A shuttle cancellation can happen on either side of commit.  In both
+ * cases the thread is still on the sleepqueue and owns its thread lock.
+ * Remove the pending sleep and consume that lock exactly once.
+ */
+static void
+sleepq_shuttle_abort(const void *wchan, struct thread *td)
+{
+	struct sleepqueue *sq;
+
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	MPASS(TD_ON_SLEEPQ(td));
+	sq = sleepq_lookup(wchan);
+	MPASS(sq != NULL);
+	sleepq_remove_thread(sq, td);
+	TD_CLR_SLEEPING(td);
+	TD_SET_RUNNING(td);
+	sched_shuttle_abort(td);
+	thread_unlock(td);
+}
+#endif
+
 /*
  * Switches to another thread if we are still asleep on a sleep queue.
  *
@@ -548,7 +586,10 @@ sleepq_switch(const void *wchan, int pri)
 	struct sleepqueue_chain *sc;
 	struct sleepqueue *sq;
 	struct thread *td;
-	bool rtc_changed;
+#ifdef DOORFS
+	enum sched_shuttle_result cr;
+#endif
+	bool rtc_changed, shuttle_switched;
 
 	td = curthread;
 	sc = SC_LOOKUP(wchan);
@@ -605,7 +646,31 @@ sleepq_switch(const void *wchan, int pri)
 	thread_lock_set(td, &sc->sc_lock);
 	SDT_PROBE0(sched, , , sleep);
 	TD_SET_SLEEPING(td);
-	mi_switch(SW_VOL | SWT_SLEEPQ);
+	shuttle_switched = false;
+
+#ifdef DOORFS
+	/*
+	 * A shuttle relationship is prepared by the caller before entering
+	 * the sleepqueue.  Commit it only after the normal sleepqueue path has
+	 * installed td on wchan and marked it sleeping.  Calls without an armed
+	 * shuttle return FALLBACK and retain the original mi_switch() path.
+	 */
+	cr = sched_shuttle_commit(td, 0);
+	if (cr == SCHED_SHUTTLE_OK)
+		cr = sched_shuttle_switch(td, 0);
+	if (cr == SCHED_SHUTTLE_ABORTED) {
+		/*
+		 * A wakeup before commit or cancellation before the switch must
+		 * remove the pending sleep locally without losing the wakeup.
+		 */
+		sleepq_shuttle_abort(wchan, td);
+		return;
+	}
+	shuttle_switched = cr == SCHED_SHUTTLE_OK;
+#endif
+	if (!shuttle_switched)
+		mi_switch(SW_VOL | SWT_SLEEPQ);
+
 	KASSERT(TD_IS_RUNNING(td), ("running but not TDS_RUNNING"));
 	CTR3(KTR_PROC, "sleepq resume: thread %p (pid %ld, %s)",
 	    (void *)td, (long)td->td_proc->p_pid, (void *)td->td_name);
@@ -788,6 +853,16 @@ sleepq_resume_thread(struct sleepqueue *sq, struct thread *td, int pri,
 	if (TD_IS_SLEEPING(td)) {
 		MPASS(!drop);
 		TD_CLR_SLEEPING(td);
+#ifdef DOORFS
+		/*
+		 * The normal sleepqueue removal leaves td in TDS_CAN_RUN.  Give the
+		 * active scheduler one atomic opportunity to turn it into the
+		 * dedicated TDS_SHUTTLE reservation state.  FALLBACK keeps the
+		 * historical setrunnable() behavior unchanged.
+		 */
+		if (sched_shuttle_wakeup(td, srqflags) == SCHED_SHUTTLE_OK)
+			return;
+#endif
 		setrunnable(td, srqflags);
 	} else {
 		MPASS(drop);

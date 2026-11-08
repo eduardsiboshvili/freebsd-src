@@ -319,7 +319,10 @@ print_file_info(struct procstat *procstat, struct filestat *fst,
 	case PS_FST_TYPE_EVENTFD:
 		printf(" [eventfd]");
 		break;
-	default:	
+	case PS_FST_TYPE_DOOR:
+		printf(" [door]");
+		break;
+	default:
 		if (vflg)
 			fprintf(stderr,
 			    "unknown file type %d for file %d of pid %d\n",
