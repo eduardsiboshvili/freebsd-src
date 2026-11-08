@@ -74,6 +74,7 @@ struct nameidata;
 #define	DTYPE_INOTIFY	15	/* inotify descriptor */
 #define	DTYPE_JAILDESC	16	/* jail descriptor */
 #define	DTYPE_NTSYNC	17	/* /dev/ntsync */
+#define	DTYPE_DOOR	18	/* Door IPC endpoint */
 
 #ifdef _KERNEL
 

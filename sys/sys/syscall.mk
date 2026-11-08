@@ -449,4 +449,4 @@ MIASM =  \
 	pddupfd.o \
 	pdptrace.o \
 	chaltroot.o \
-	fchaltroot.o
+	fchaltroot.o \

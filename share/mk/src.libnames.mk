@@ -148,6 +148,7 @@ _LIBRARIES=	\
 		devinfo \
 		devstat \
 		dl \
+		door \
 		dtrace \
 		dwarf \
 		edit \
@@ -361,6 +362,7 @@ _DP_blacklist+=	pthread
 _DP_blocklist+=	pthread
 .endif
 _DP_devstat=	kvm
+_DP_door=	pthread
 _DP_dtrace=	ctf elf proc pthread rtld_db xo
 _DP_dwarf=	elf z
 _DP_edit=	tinfow

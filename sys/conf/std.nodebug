@@ -28,3 +28,6 @@ nooptions	HID_DEBUG
 # CAM debugging
 nooptions	CAMDEBUG
 nooptions	CAM_DEBUG_FLAGS
+
+# Extended Doors IPC debugging
+nooptions	DOORFS_TEST

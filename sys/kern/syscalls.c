@@ -613,4 +613,5 @@ const char *syscallnames[] = {
 	"pdptrace",			/* 605 = pdptrace */
 	"chaltroot",			/* 606 = chaltroot */
 	"fchaltroot",			/* 607 = fchaltroot */
+	"door",			/* 606 = door */
 };

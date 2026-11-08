@@ -140,6 +140,7 @@
 #define	SRQ_BORROWING	0x0010		/* Priority updated due to prio_lend */
 #define	SRQ_HOLD	0x0020		/* Return holding original td lock */
 #define	SRQ_HOLDTD	0x0040		/* Return holding td lock */
+#define	SRQ_DOOR_WAKE	0x0080		/* Door worker wakeup */
 
 /*
  * Functions to be directly dispatched to the active scheduler instance.
@@ -273,6 +274,34 @@
 	 */								\
 	FUN((__VA_ARGS__), void, init_ap)
 
+#define SCHED_ITF_DOOR(FUN, ...) \
+	FUN((__VA_ARGS__), enum sched_shuttle_result, shuttle_prepare, \
+	    struct thread *, td, struct thread *, peer, const void *, wchan, int, flags) \
+	FUN((__VA_ARGS__), enum sched_shuttle_result, shuttle_commit, \
+	    struct thread *, td, int, flags) \
+	FUN((__VA_ARGS__), enum sched_shuttle_result, shuttle_resume, \
+	    struct thread *, td, int, flags) \
+	FUN((__VA_ARGS__), enum sched_shuttle_result, shuttle_dispatch, \
+	    struct thread *, td, struct thread *, peer, const void *, wchan, int, flags) \
+	FUN((__VA_ARGS__), enum sched_shuttle_result, shuttle_sleep, \
+	    struct thread *, td, struct thread *, peer, const void *, wchan, int, flags) \
+	FUN((__VA_ARGS__), enum sched_shuttle_result, shuttle_resume_to, \
+	    struct thread *, td, struct thread *, owner, int, flags) \
+	FUN((__VA_ARGS__), enum sched_shuttle_result, shuttle_swtch, \
+	    struct thread *, td, int, flags) \
+	FUN((__VA_ARGS__), enum sched_shuttle_result, shuttle_wakeup, \
+	    struct thread *, td, int, flags) \
+	FUN((__VA_ARGS__), void, shuttle_cancel, \
+	    struct thread *, td, int, srqflags) \
+	FUN((__VA_ARGS__), void, shuttle_unpark, \
+	    struct thread *, td, int, srqflags) \
+	FUN((__VA_ARGS__), enum sched_shuttle_result, shuttle_switch, \
+	    struct thread *, td, int, flags) \
+	FUN((__VA_ARGS__), void, shuttle_sswitch, \
+	    struct thread *, td, int, flags) \
+	FUN((__VA_ARGS__), void, shuttle_abort, \
+	    struct thread *, td)
+
 /*
  * Instance functions to be specifically wrapped.
  *
@@ -371,6 +400,73 @@
 struct proc;
 struct thread;
 
+/*
+ * Optional scheduler-assisted thread handoff state.  This state is stored
+ * in each scheduler's private struct td_sched, not in struct thread, so the
+ * public kernel binary interface layout of struct thread is unchanged.
+ */
+enum sched_shuttle_state {
+	SCHED_SHUTTLE_NONE = 0,
+	SCHED_SHUTTLE_PREPARED,
+	SCHED_SHUTTLE_COMMITTED,
+	SCHED_SHUTTLE_SLEEPING,
+	SCHED_SHUTTLE_RESUMING
+};
+
+enum sched_shuttle_result {
+	SCHED_SHUTTLE_OK = 0,
+	SCHED_SHUTTLE_FALLBACK,
+	SCHED_SHUTTLE_ABORTED,
+	SCHED_SHUTTLE_RETRY
+};
+
+#define	SCHED_SHUTTLE_F_INTERRUPTIBLE	0x0001
+#define	SCHED_SHUTTLE_F_SAMECPU		0x0002
+#define	SCHED_SHUTTLE_F_DISPATCH	0x0004
+#define	SCHED_SHUTTLE_F_REPLY		0x0008
+#define	SCHED_SHUTTLE_F_IDLE_WAIT	0x0010
+/* Waker continues running and cannot own an exact-successor reservation. */
+#define	SCHED_SHUTTLE_F_ASYNC_WAKE	0x0020
+
+struct sched_shuttle {
+	struct thread	*ss_peer;
+	const void	*ss_wchan;
+	uint64_t	 ss_generation;
+	uint32_t	 ss_flags;
+	uint8_t		 ss_state;
+	uint8_t		 ss_pending;
+};
+
+/*
+ * Scheduler-neutral token for a possible direct handoff.  The scheduler may
+ * cache private validation data in sst_sched_data, but MI consumers must
+ * treat it as opaque.
+ *
+ * A scheduler may return with RESERVED set and the peer temporarily removed
+ * from its normal runnable representation.  MI code must treat
+ * sst_sched_data and the saved run-queue fields as opaque.  Reservation
+ * commit and restoration belong to the scheduler backend; MI code does not
+ * acquire or roll back runnable-peer reservations directly.
+ * ULE retains its TDQ lock across a runnable-peer reservation; 4BSD protects
+ * parked-peer reservations with its global scheduler lock.
+ */
+#define	SCHED_SHUTTLE_TOKEN_VALIDATED	0x00000001U
+#define	SCHED_SHUTTLE_TOKEN_LOCAL	0x00000002U
+#define	SCHED_SHUTTLE_TOKEN_RUNNABLE	0x00000004U
+#define	SCHED_SHUTTLE_TOKEN_RESERVED	0x00000008U
+#define	SCHED_SHUTTLE_TOKEN_WAKE_RESERVED	0x00000010U
+struct sched_shuttle_token {
+	struct thread	*sst_cur;
+	struct thread	*sst_peer;
+	struct thread	*sst_candidate;
+	void		*sst_sched_data;
+	uint64_t	 sst_generation;
+	uint32_t	 sst_flags;
+	int		 sst_cpu;
+	int		 sst_rqindex;
+	bool		 sst_xferable;
+};
+
 #ifndef SCHED_IMPLEMENTATION
 
 /*
@@ -383,6 +479,7 @@ struct thread;
 		(SCHED_ITF_ARGS_PROTO_NONAME(__VA_ARGS__));
 SCHED_ITF_DISPATCH(_SCHED_ITF_FUN, );
 SCHED_ITF_WRAP(_SCHED_ITF_FUN, );
+SCHED_ITF_DOOR(_SCHED_ITF_FUN, );
 #undef _SCHED_ITF_FUN
 
 #else /* SCHED_IMPLEMENTATION */
@@ -398,6 +495,9 @@ SCHED_ITF_WRAP(_SCHED_ITF_FUN, );
 	SCHED_ITF_IMPL_FUNCTION_NAME(_SCHED_ITF_ARG1 args, fn)		\
 		(SCHED_ITF_ARGS_PROTO_NAME(__VA_ARGS__));
 SCHED_ITF_NOCOMMON(_SCHED_ITF_FUN, SCHED_IMPLEMENTATION)
+#ifdef DOORFS
+SCHED_ITF_DOOR(_SCHED_ITF_FUN, SCHED_IMPLEMENTATION)
+#endif
 #undef _SCHED_ITF_FUN
 
 #endif /* !SCHED_IMPLEMENTATION */
@@ -509,6 +609,9 @@ extern dtrace_vtime_switch_func_t dtrace_vtime_switch_func;
 	(SCHED_ITF_ARGS_PROTO_NONAME(__VA_ARGS__));
 struct sched_instance {
 	SCHED_ITF_NOCOMMON(_SCHED_ITF_FUN, )
+#ifdef DOORFS
+	SCHED_ITF_DOOR(_SCHED_ITF_FUN, )
+#endif
 };
 #undef _SCHED_ITF_FUN
 
@@ -526,11 +629,19 @@ struct sched_selection {
 #endif /* SCHED_IMPLEMENTATION || SCHED_SHIM */
 
 #ifdef SCHED_IMPLEMENTATION
+#ifdef DOORFS
+#define _SCHED_DECLARE_DOOR_FIELDS \
+	SCHED_ITF_DOOR(_SCHED_DECLARE_FIELD_FUN, SCHED_IMPLEMENTATION)
+#else
+#define _SCHED_DECLARE_DOOR_FIELDS
+#endif
+
 #define	DECLARE_SCHEDULER(string_name)					\
 	static const struct sched_instance				\
 	__CONCAT(_sched_instance_, SCHED_IMPLEMENTATION) = {		\
 		SCHED_ITF_NOCOMMON(_SCHED_DECLARE_FIELD_FUN,		\
 		    SCHED_IMPLEMENTATION)				\
+		_SCHED_DECLARE_DOOR_FIELDS			\
 	};								\
 	static const struct sched_selection				\
 	__CONCAT(_sched_selector_, SCHED_IMPLEMENTATION) = {		\

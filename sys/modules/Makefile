@@ -101,6 +101,7 @@ SUBDIR=	\
 	dc \
 	dcons \
 	dcons_crom \
+	doorfs \
 	${_dpaa2} \
 	${_dpdk_lpm4} \
 	${_dpdk_lpm6} \
@@ -290,6 +291,7 @@ SUBDIR=	\
 	${_nctgpio} \
 	${_ncthwm} \
 	${_neta} \
+	namefs \
 	netlink \
 	${_netgraph} \
 	${_nfe} \

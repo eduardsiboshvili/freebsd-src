@@ -546,4 +546,5 @@
 #define	SYS_pdptrace	605
 #define	SYS_chaltroot	606
 #define	SYS_fchaltroot	607
+#define	SYS_door	606
 #define	SYS_MAXSYSCALL	608
