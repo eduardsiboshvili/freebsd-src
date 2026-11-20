@@ -682,5 +682,5 @@ struct sysent freebsd32_sysent[] = {
 	{ .sy_narg = AS(freebsd32_pdptrace_args), .sy_call = (sy_call_t *)freebsd32_pdptrace, .sy_auevent = AUE_PDPTRACE, .sy_flags = SYF_CAPENABLED, .sy_thrcnt = SY_THR_STATIC },	/* 605 = freebsd32_pdptrace */
 	{ .sy_narg = AS(chaltroot_args), .sy_call = (sy_call_t *)sys_chaltroot, .sy_auevent = AUE_CHALTROOT, .sy_flags = 0, .sy_thrcnt = SY_THR_STATIC },	/* 606 = chaltroot */
 	{ .sy_narg = AS(fchaltroot_args), .sy_call = (sy_call_t *)sys_fchaltroot, .sy_auevent = AUE_FCHALTROOT, .sy_flags = 0, .sy_thrcnt = SY_THR_STATIC },	/* 607 = fchaltroot */
-	{ .sy_narg = AS(freebsd32_door_args), .sy_call = (sy_call_t *)freebsd32_door, .sy_auevent = AUE_NULL, .sy_flags = SYF_CAPENABLED, .sy_thrcnt = SY_THR_STATIC },	/* 606 = freebsd32_door */
+	{ .sy_narg = AS(freebsd32_door_args), .sy_call = (sy_call_t *)freebsd32_door, .sy_auevent = AUE_NULL, .sy_flags = SYF_CAPENABLED, .sy_thrcnt = SY_THR_STATIC },	/* 608 = freebsd32_door */
 };

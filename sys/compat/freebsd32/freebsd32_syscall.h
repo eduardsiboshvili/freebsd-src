@@ -525,5 +525,5 @@
 #define	FREEBSD32_SYS_freebsd32_pdptrace	605
 #define	FREEBSD32_SYS_chaltroot	606
 #define	FREEBSD32_SYS_fchaltroot	607
-#define	FREEBSD32_SYS_freebsd32_door	606
-#define	FREEBSD32_SYS_MAXSYSCALL	608
+#define	FREEBSD32_SYS_freebsd32_door	608
+#define	FREEBSD32_SYS_MAXSYSCALL	609

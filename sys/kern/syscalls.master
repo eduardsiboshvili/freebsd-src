@@ -3466,7 +3466,7 @@
 	}
 
 ; long operands are normalized explicitly by freebsd32_door.
-606	AUE_NULL	STD|CAPENABLED|NOLIB {
+608	AUE_NULL	STD|CAPENABLED|NOLIB {
 		int door(
 		    long op,
 		    long arg1,

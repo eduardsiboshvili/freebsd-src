@@ -613,5 +613,5 @@ const char *freebsd32_syscallnames[] = {
 	"freebsd32_pdptrace",			/* 605 = freebsd32_pdptrace */
 	"chaltroot",			/* 606 = chaltroot */
 	"fchaltroot",			/* 607 = fchaltroot */
-	"freebsd32_door",			/* 606 = freebsd32_door */
+	"freebsd32_door",			/* 608 = freebsd32_door */
 };
