@@ -20,7 +20,16 @@ and transported through
 Door descriptors have file type
 .Dv DTYPE_DOOR .
 They are not byte streams: ordinary read, write, truncate, polling, and vnode
-I/O operations are rejected.
+I/O operations are rejected for ordinary service descriptors.
+Owner-drained native async completion endpoints are a specific exception:
+read returns one complete notification without blocking, and
+.Dv EVFILT_READ
+reports ready records or
+.Dv EV_EOF
+on revoke. They cannot acquire server bindings, are owner-process-only, and
+retain descriptor-bearing notifications until collection or discard.
+Use the libdoor event-loop functions rather than reading their borrowed fd
+outside libdoor.
 Descriptors may be duplicated, inherited, passed between processes, restricted
 with Capsicum, and published through
 .Xr namefs 4 .

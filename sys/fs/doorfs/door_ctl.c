@@ -5,6 +5,7 @@
  */
 
 #include <sys/param.h>
+#include <machine/atomic.h>
 #include <sys/systm.h>
 #include <sys/conf.h>
 #include <sys/jail.h>
@@ -25,6 +26,13 @@ enum door_named_state {
 	DOOR_NAMED_DEAD,
 };
 
+/* Separate lifetime: CONNECT can outlive unregister, GC or replacement. */
+struct door_named_policy {
+	u_int dnp_refs;
+	uint32_t dnp_flags;
+	volatile u_int dnp_claimed;
+};
+
 struct door_named_entry {
 	LIST_ENTRY(door_named_entry) dne_link;
 	TAILQ_ENTRY(door_named_entry) dne_dead_link;
@@ -34,6 +42,7 @@ struct door_named_entry {
 	 * Door pointer and therefore cannot pin a revoked generation in memory.
 	 */
 	struct door *dne_door;
+	struct door_named_policy *dne_policy;
 	struct ucred *dne_scope_cred;
 	uint64_t dne_uniquifier;
 	time_t dne_dead_since;
@@ -127,6 +136,34 @@ door_named_same_scope(
 }
 
 static void
+door_named_policy_drop(struct door_named_policy *policy)
+{
+
+	if (policy != NULL && refcount_release(&policy->dnp_refs))
+		free(policy, M_DOORFS);
+}
+
+/* Reserve before installing a file; never hold registry/endpoint locks here. */
+static int
+door_named_policy_claim(struct door_named_policy *policy)
+{
+
+	if (policy == NULL ||
+	    (policy->dnp_flags & DOOR_NAMED_F_CONNECT_ONCE) == 0)
+		return (0);
+	return (atomic_cmpset_int(&policy->dnp_claimed, 0, 1) ? 0 : EACCES);
+}
+
+static void
+door_named_policy_rollback(struct door_named_policy *policy)
+{
+
+	if (policy != NULL &&
+	    (policy->dnp_flags & DOOR_NAMED_F_CONNECT_ONCE) != 0)
+		atomic_store_rel_int(&policy->dnp_claimed, 0);
+}
+
+static void
 door_named_entry_free(struct door_named_entry *e)
 {
 	KASSERT(e->dne_door == NULL, ("freeing LIVE named Door entry"));
@@ -136,6 +173,7 @@ door_named_entry_free(struct door_named_entry *e)
 		crfree(e->dne_scope_cred);
 		e->dne_scope_cred = NULL;
 	}
+	door_named_policy_drop(e->dne_policy);
 	free(e, M_DOORFS);
 }
 
@@ -244,11 +282,12 @@ door_named_register(struct door_ctl_register *arg, struct thread *td)
 {
 	struct door_named_entry *e, *newent;
 	struct door *door, *old;
+	struct door_named_policy *policy;
 	bool global, revoked;
 	int error;
 
 	if (arg->dcr_version != DOOR_CTL_ABI_VERSION ||
-	    (arg->dcr_flags & ~DOOR_NAMED_F_GLOBAL) != 0 ||
+	    (arg->dcr_flags & ~DOOR_NAMED_F_REGISTER_MASK) != 0 ||
 	    arg->dcr_reserved != 0)
 		return (EINVAL);
 	error = door_name_validate(arg->dcr_name);
@@ -266,6 +305,11 @@ door_named_register(struct door_ctl_register *arg, struct thread *td)
 	}
 
 	newent = malloc(sizeof(*newent), M_DOORFS, M_WAITOK | M_ZERO);
+	newent->dne_policy = malloc(sizeof(*newent->dne_policy), M_DOORFS,
+	    M_WAITOK | M_ZERO);
+	refcount_init(&newent->dne_policy->dnp_refs, 1);
+	newent->dne_policy->dnp_flags = arg->dcr_flags &
+	    (DOOR_NAMED_F_NO_PASS | DOOR_NAMED_F_CONNECT_ONCE);
 	strlcpy(newent->dne_name, arg->dcr_name, sizeof(newent->dne_name));
 	newent->dne_global = global;
 	newent->dne_state = DOOR_NAMED_LIVE;
@@ -306,6 +350,9 @@ door_named_register(struct door_ctl_register *arg, struct thread *td)
 				    ("named DEAD count underflow"));
 				door_named_dead_count--;
 			}
+			policy = e->dne_policy;
+			e->dne_policy = newent->dne_policy;
+			newent->dne_policy = policy;
 			e->dne_door = door;
 			e->dne_uniquifier = door->d_uniquifier;
 			e->dne_dead_since = 0;
@@ -337,6 +384,9 @@ door_named_register(struct door_ctl_register *arg, struct thread *td)
 		 * doorctl_generation_revoked() has already converted it to DEAD.
 		 */
 		old = e->dne_door;
+		policy = e->dne_policy;
+		e->dne_policy = newent->dne_policy;
+		newent->dne_policy = policy;
 		e->dne_door = door;
 		e->dne_uniquifier = door->d_uniquifier;
 		e->dne_state = DOOR_NAMED_LIVE;
@@ -453,11 +503,14 @@ door_named_unregister(struct door_ctl_unregister *arg, struct thread *td)
  * snapshot, not a reservation of the generation for a later connect.
  */
 static struct door *
-door_named_lookup_hold(const char *name, struct ucred *cred)
+door_named_lookup_hold(const char *name, struct ucred *cred,
+    struct door_named_policy **policyp)
 {
 	struct door_named_entry *e;
 	struct door *door;
 
+	if (policyp != NULL)
+		*policyp = NULL;
 	door = NULL;
 	mtx_lock(&door_named_lock);
 
@@ -470,6 +523,10 @@ door_named_lookup_hold(const char *name, struct ucred *cred)
 		KASSERT(e->dne_door != NULL, ("LIVE named entry without Door"));
 		door = e->dne_door;
 		door_hold(door);
+		if (policyp != NULL) {
+			*policyp = e->dne_policy;
+			refcount_acquire(&e->dne_policy->dnp_refs);
+		}
 		break;
 	}
 
@@ -483,6 +540,10 @@ door_named_lookup_hold(const char *name, struct ucred *cred)
 			    ("LIVE global named entry without Door"));
 			door = e->dne_door;
 			door_hold(door);
+			if (policyp != NULL) {
+				*policyp = e->dne_policy;
+				refcount_acquire(&e->dne_policy->dnp_refs);
+			}
 			break;
 		}
 	}
@@ -495,6 +556,7 @@ static int
 door_named_connect(struct door_ctl_connect *arg, struct thread *td)
 {
 	struct door *door;
+	struct door_named_policy *policy;
 	int error, fd, jid;
 	uint64_t id;
 
@@ -504,7 +566,7 @@ door_named_connect(struct door_ctl_connect *arg, struct thread *td)
 	if (error != 0)
 		return (error);
 
-	door = door_named_lookup_hold(arg->dcc_name, td->td_ucred);
+	door = door_named_lookup_hold(arg->dcc_name, td->td_ucred, &policy);
 	if (door == NULL)
 		return (ENOENT);
 
@@ -518,6 +580,7 @@ door_named_connect(struct door_ctl_connect *arg, struct thread *td)
 	error = door_check_jail(door, td->td_ucred);
 	if (error != 0) {
 		door_drop(door);
+		door_named_policy_drop(policy);
 		return (error);
 	}
 
@@ -525,6 +588,7 @@ door_named_connect(struct door_ctl_connect *arg, struct thread *td)
 	if (door->d_revoked) {
 		mtx_unlock(&door->d_lock);
 		door_drop(door);
+		door_named_policy_drop(policy);
 		return (EBADF);
 	}
 	jid = door->d_owner_cred != NULL ? door->d_owner_cred->cr_prison->pr_id
@@ -532,8 +596,20 @@ door_named_connect(struct door_ctl_connect *arg, struct thread *td)
 	id = door->d_uniquifier;
 	mtx_unlock(&door->d_lock);
 
+	error = door_named_policy_claim(policy);
+	if (error != 0) {
+		door_drop(door);
+		door_named_policy_drop(policy);
+		return (error);
+	}
+
 	fd = -1;
-	error = door_client_file_install(td, door, &fd);
+	error = door_client_file_install_policy(td, door,
+	    (policy->dnp_flags & DOOR_NAMED_F_NO_PASS) == 0, &fd);
+	if (error != 0)
+		door_named_policy_rollback(policy);
+	/* Installation commits the budget, even if ioctl's later copyout fails. */
+	door_named_policy_drop(policy);
 	door_drop(door);
 	if (error != 0)
 		return (error);
@@ -556,7 +632,7 @@ door_named_lookup(struct door_ctl_lookup *arg, struct thread *td)
 	if (error != 0)
 		return (error);
 
-	door = door_named_lookup_hold(arg->dcl_name, td->td_ucred);
+	door = door_named_lookup_hold(arg->dcl_name, td->td_ucred, NULL);
 	if (door == NULL)
 		return (ENOENT);
 

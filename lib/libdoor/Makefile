@@ -12,6 +12,9 @@ MLINKS=		door.3 door_create.3 \
 		door.3 door_call.3 \
 		door.3 door_oneway.3 \
 		door.3 door_async_open.3 \
+		door.3 door_async_open_poll.3 \
+		door.3 door_async_poll_fd.3 \
+		door.3 door_async_dispatch.3 \
 		door.3 door_async_submit.3 \
 		door.3 door_async_cancel.3 \
 		door.3 door_async_close.3 \

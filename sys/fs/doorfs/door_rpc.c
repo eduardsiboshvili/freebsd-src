@@ -11,6 +11,7 @@
 #include <sys/systm.h>
 #include <sys/jail.h>
 #include <sys/file.h>
+#include <sys/uio.h>
 #include <sys/filedesc.h>
 #include <sys/fcntl.h>
 #include <sys/malloc.h>
@@ -364,7 +365,71 @@ door_call_alloc_inline(
 	return (call);
 }
 
+/*
+ * Queue membership and ID membership change under the same d_lock. The index
+ * owns no reference: its lifetime is exactly the union of d_pending, d_active
+ * and d_async_replies. Queue-to-queue transitions may unlink/relink while the
+ * mutex remains held. Generated IDs retain their existing collision semantics;
+ * caller-supplied IDs reject any matching entry in the bucket.
+ */
+static __inline u_int
+door_call_id_bucket(uint64_t id)
+{
+
+	/* Mix both halves: sequential IDs and context-prefixed IDs share buckets. */
+	id ^= id >> 30;
+	id *= 0xbf58476d1ce4e5b9ULL;
+	id ^= id >> 27;
+	id *= 0x94d049bb133111ebULL;
+	id ^= id >> 31;
+	return ((u_int)id & (DOOR_CALL_ID_BUCKETS - 1));
+}
+
+void
+door_call_id_insert_locked(struct door *door, struct door_call *call)
+{
+
+	mtx_assert(&door->d_lock, MA_OWNED);
+	KASSERT(call->dc_id_owner == NULL, ("indexing an indexed Door call"));
+	LIST_INSERT_HEAD(&door->d_call_ids[door_call_id_bucket(call->dc_id)],
+	    call, dc_id_link);
+	call->dc_id_owner = door;
+}
+
+void
+door_call_id_remove_locked(struct door *door, struct door_call *call)
+{
+
+	mtx_assert(&door->d_lock, MA_OWNED);
+	KASSERT(call->dc_id_owner == door, ("Door call ID index owner mismatch"));
+	LIST_REMOVE(call, dc_id_link);
+	call->dc_id_owner = NULL;
+}
+
 static void door_call_drop(struct door_call *);
+
+static void
+door_async_notification_drop(struct door_call *event)
+{
+	struct door_call *origin;
+	struct door *source;
+
+	origin = event->dc_async_origin;
+	if (origin == NULL)
+		return;
+
+	source = origin->dc_async_source;
+	/* Destruction runs without either endpoint's lock. */
+	mtx_lock(&source->d_lock);
+	if (!origin->dc_reply_install_done && !origin->dc_async_receiving) {
+		origin->dc_reply_install_error = ECANCELED;
+		origin->dc_reply_install_done = true;
+		cv_broadcast(&origin->dc_cv);
+	}
+	mtx_unlock(&source->d_lock);
+	door_call_drop(origin);
+}
+
 
 static void
 door_call_local_drop(struct door_call *call)
@@ -396,8 +461,13 @@ door_call_drop(struct door_call *call)
 {
 	if (!refcount_release(&call->dc_refs))
 		return;
+	KASSERT(call->dc_id_owner == NULL,
+	    ("destroying an indexed Door call"));
 	KASSERT(!call->dc_async_reserved,
 	    ("destroying async call with reserved completion slot"));
+	door_async_notification_drop(call);
+	if (call->dc_async_source != NULL)
+		door_drop(call->dc_async_source);
 	if (call->dc_async_target != NULL)
 		door_drop(call->dc_async_target);
 	if (call->dc_async_result != NULL)
@@ -871,6 +941,7 @@ door_call_activate_locked(
 	}
 	call->dc_state = DOOR_CALL_ACTIVE;
 	TAILQ_INSERT_TAIL(&door->d_active, call, dc_link);
+	door_call_id_insert_locked(door, call);
 	door->d_active_count++;
 	ds->ds_call = call;
 	call->dc_server_td = ds->ds_td;
@@ -895,14 +966,17 @@ door_call_dispatch_locked(struct door *door, struct door_call *call)
 {
 	struct door_server_binding *ds;
 
-	ds = door_idle_server_find_locked(door);
+	ds = door->d_completion_manual ? NULL : door_idle_server_find_locked(door);
 	if (ds != NULL) {
 		door_call_activate_locked(door, call, ds);
 		return (ds);
 	}
 
 	TAILQ_INSERT_TAIL(&door->d_pending, call, dc_link);
+	door_call_id_insert_locked(door, call);
 	door->d_pending_count++;
+	if (door->d_completion_manual)
+		KNOTE_LOCKED(&door->d_completion_knlist, 0);
 	return (NULL);
 }
 
@@ -920,6 +994,87 @@ door_oneway_drop(struct door_call *call)
 	KASSERT(call->dc_type == DOOR_CALL_RPC && call->dc_oneway,
 	    ("dropping non-ONEWAY call as ONEWAY"));
 	door_call_drop(call);
+}
+
+
+/*
+ * One complete notification per read. A successful read retains the event
+ * until the next read or revoke: its descriptor transaction must remain alive
+ * while userspace collects descriptors. A failed/short read does not dequeue.
+ * No two endpoint locks are held and uiomove never runs under d_lock.
+ */
+int
+door_completion_read(struct door *door, struct uio *uio, struct thread *td)
+{
+	struct door_call *call, *previous;
+	int error;
+
+	/* The read's file reference pins door. Owner removal also holds d_lock. */
+	mtx_lock(&door->d_lock);
+	if (!door->d_completion_manual) {
+		mtx_unlock(&door->d_lock);
+		return (EOPNOTSUPP);
+	}
+	if (!door->d_owner_linked || door->d_owner != td->td_proc ||
+	    door->d_revoked || door->d_orphaning) {
+		error = !door->d_owner_linked || door->d_owner != td->td_proc ?
+		    EPERM : EBADF;
+		mtx_unlock(&door->d_lock);
+		return (error);
+	}
+	if (door->d_completion_reading) {
+		mtx_unlock(&door->d_lock);
+		return (EBUSY);
+	}
+
+	door->d_completion_reading = true;
+	previous = door->d_completion_held;
+	door->d_completion_held = NULL;
+	if (previous != NULL) {
+		mtx_unlock(&door->d_lock);
+		door_oneway_drop(previous);
+		mtx_lock(&door->d_lock);
+	}
+
+	call = NULL;
+	if (door->d_revoked || door->d_orphaning)
+		error = EBADF;
+	else if (TAILQ_EMPTY(&door->d_pending))
+		error = EAGAIN;
+	else {
+		call = TAILQ_FIRST(&door->d_pending);
+		if (call->dc_request.dx_size > INT_MAX || uio->uio_resid < 0 ||
+		    (size_t)uio->uio_resid < call->dc_request.dx_size) {
+			call = NULL;
+			error = EMSGSIZE;
+		} else {
+			door_call_hold(call); /* Copyout survives concurrent revoke. */
+			mtx_unlock(&door->d_lock);
+			error = uiomove(call->dc_request.dx_buffer,
+			    (int)call->dc_request.dx_size, uio);
+			mtx_lock(&door->d_lock);
+			if (error == 0) {
+				if (door->d_revoked || door->d_orphaning)
+					error = EBADF;
+				else {
+					TAILQ_REMOVE(&door->d_pending, call, dc_link);
+					door_call_id_remove_locked(door, call);
+					door->d_pending_count--;
+					door->d_completion_held = call; /* Queue ref transfers. */
+					/* Rearm EV_CLEAR users when a budget leaves records. */
+					if (door->d_pending_count != 0)
+						KNOTE_LOCKED(&door->d_completion_knlist, 0);
+				}
+			}
+		}
+	}
+
+	door->d_completion_reading = false;
+	mtx_unlock(&door->d_lock);
+	if (call != NULL)
+		door_call_drop(call); /* Copyout reference, not the retained event. */
+
+	return (error);
 }
 
 /*
@@ -1211,6 +1366,9 @@ door_server_bind(struct door *door, struct thread *td)
 	struct door_server_binding *ds;
 	int error;
 
+	if (door->d_completion_manual)
+		return (EOPNOTSUPP);
+
 	if (__predict_false(td->td_door_server != NULL))
 		return (EBUSY);
 
@@ -1379,6 +1537,7 @@ door_server_worker_exit(struct door *door, struct thread *td)
 		if (call->dc_state == DOOR_CALL_ACTIVE ||
 		    call->dc_state == DOOR_CALL_CANCELLED) {
 			TAILQ_REMOVE(&door->d_active, call, dc_link);
+			door_call_id_remove_locked(door, call);
 			door->d_active_count--;
 		}
 		if (call->dc_state == DOOR_CALL_ACTIVE) {
@@ -1500,19 +1659,19 @@ door_server_cred_bound(struct thread *td, struct door_ioc_cred *arg)
 	return (door_server_cred(ds->ds_door, td, arg));
 }
 
-/* Caller-supplied IDs must be unique among live queued/active calls. */
+/* Caller-supplied IDs remain reserved through descriptor collection. */
 static int
 door_call_check_id_locked(struct door *door, uint64_t id)
 {
- struct door_call *iter;
- mtx_assert(&door->d_lock, MA_OWNED);
- TAILQ_FOREACH(iter, &door->d_pending, dc_link)
-  if (iter->dc_id == id)
-   return (EEXIST);
- TAILQ_FOREACH(iter, &door->d_active, dc_link)
-  if (iter->dc_id == id)
-   return (EEXIST);
- return (0);
+	struct door_call *iter;
+
+	mtx_assert(&door->d_lock, MA_OWNED);
+	LIST_FOREACH(iter, &door->d_call_ids[door_call_id_bucket(id)],
+	    dc_id_link) {
+		if (iter->dc_id == id)
+			return (EEXIST);
+	}
+	return (0);
 }
 
 static __inline int
@@ -1545,6 +1704,7 @@ door_cancel_call_locked(struct door *door, struct door_call *call, int error,
 	switch (call->dc_state) {
 	case DOOR_CALL_PENDING:
 		TAILQ_REMOVE(&door->d_pending, call, dc_link);
+		door_call_id_remove_locked(door, call);
 		door->d_pending_count--;
 		break;
 	case DOOR_CALL_ACTIVE:
@@ -1821,6 +1981,11 @@ door_async_task(void *context, int pending __unused)
 	default:
 		break;
 	}
+	if (origin->dc_async_source != NULL) {
+		header.dac_flags |= DOOR_ASYNC_C_REPLY_DESC;
+		event->dc_async_origin = origin;
+		door_call_hold(origin);
+	}
 	header.dac_data_size = origin->dc_async_result_size;
 	bcopy(&header, event->dc_request.dx_buffer, sizeof(header));
 	if (origin->dc_async_result_size != 0)
@@ -1917,7 +2082,8 @@ door_async_call(struct door *door, struct door *target,
 	size_t capacity, size;
 	int error;
 
-	if (arg->diac_version != DOOR_ABI_VERSION || arg->diac_flags != 0 ||
+	if (arg->diac_version != DOOR_ABI_VERSION ||
+	    (arg->diac_flags & ~DOOR_ASYNC_F_MASK) != 0 ||
 	    arg->diac_reserved != 0 || arg->diac_call_id == 0 ||
 	    arg->diac_request_size > SIZE_MAX ||
 	    (arg->diac_request_size != 0 && arg->diac_request_ptr == 0)) {
@@ -1968,6 +2134,8 @@ door_async_call(struct door *door, struct door *target,
 	call->dc_type = DOOR_CALL_RPC;
 	call->dc_oneway = true; /* independent of the submitting thread */
 	call->dc_async = true;
+	call->dc_async_reply_desc =
+	    (arg->diac_flags & DOOR_ASYNC_F_REPLY_DESC) != 0;
 
 	call->dc_async_reserved = true;
 	call->dc_async_target = target;
@@ -1999,6 +2167,7 @@ door_async_call(struct door *door, struct door *target,
 		error = door_check_limits_locked(door, size, 0);
 	if (error == 0 && door->d_pending_count >= DOOR_ONEWAY_PENDING_MAX)
 		error = EAGAIN;
+
 
 	if (error == 0)
 		error = door_call_check_id_locked(door, arg->diac_call_id);
@@ -2033,6 +2202,55 @@ fail:
 }
 
 /*
+ * Install in the receiver, then let the original server commit MOVE.  A
+ * notification alone never commits ownership. No two Door locks are nested.
+ */
+int
+door_async_recv_desc(struct door *door, struct door *target,
+    const struct door_ioc_async_recv_desc *arg, struct thread *td,
+    uint32_t *count)
+{
+	struct door_call *call;
+	int error;
+
+	*count = 0;
+	mtx_lock(&door->d_lock);
+	TAILQ_FOREACH(call, &door->d_async_replies, dc_async_reply_link) {
+		if (call->dc_id == arg->diard_call_id &&
+		    call->dc_async_target == target)
+			break;
+	}
+	if (call == NULL) {
+		mtx_unlock(&door->d_lock);
+		return (ESRCH);
+	}
+	if (call->dc_async_receiving || call->dc_reply_install_done) {
+		mtx_unlock(&door->d_lock);
+		return (EALREADY);
+	}
+	call->dc_async_receiving = true;
+	door_call_hold(call);
+	mtx_unlock(&door->d_lock);
+
+	error = door_fd_bundle_install(td, &call->dc_reply_fds,
+	    arg->diard_desc_ptr, arg->diard_capacity, NULL);
+
+	mtx_lock(&door->d_lock);
+	call->dc_reply_install_error = error;
+	call->dc_reply_install_done = true;
+	cv_broadcast(&call->dc_cv);
+	if (error == 0) {
+		/* Publication of receiver fds commits MOVE, even across revoke. */
+		while (!call->dc_reply_move_done)
+			cv_wait(&call->dc_cv, &door->d_lock);
+		*count = call->dc_reply_fds.df_count;
+	}
+	mtx_unlock(&door->d_lock);
+	door_call_drop(call);
+	return (error);
+}
+
+/*
  * Compact data-only ONEWAY submit path.
  *
  * The public DOOR_ONEWAY policy already implies DOOR_REFUSE_DESC at create
@@ -2049,6 +2267,9 @@ door_oneway_submit(
 	size_t request_storage_capacity;
 	u_int hot_flags;
 	int error;
+
+	if (door->d_completion_manual)
+		return (EOPNOTSUPP);
 
 	if (size != 0 && uptr == 0)
 		return (EINVAL);
@@ -2165,6 +2386,9 @@ door_call(struct door *door, struct door_ioc_call *arg, struct thread *td,
 	uint32_t desc_capacity;
 	bool early_dispatch, oneway, reply_mapped, simple_reply;
 	int error, wait_error, install_error;
+
+	if (door->d_completion_manual)
+		return (EOPNOTSUPP);
 
 	if (arg->dic_version != DOOR_ABI_VERSION ||
 	    (arg->dic_request_size != 0 && arg->dic_request_ptr == 0) ||
@@ -2652,6 +2876,7 @@ door_server_discard_cancelled_locked(
 	KASSERT(ds->ds_call == call, ("cancelled server call mismatch"));
 	if (call->dc_state == DOOR_CALL_CANCELLED) {
 		TAILQ_REMOVE(&door->d_active, call, dc_link);
+		door_call_id_remove_locked(door, call);
 		door->d_active_count--;
 	}
 	ds->ds_call = NULL;
@@ -2677,6 +2902,7 @@ door_server_requeue_undelivered_locked(
 	    ("requeue call in state %d", call->dc_state));
 
 	TAILQ_REMOVE(&door->d_active, call, dc_link);
+	door_call_id_remove_locked(door, call);
 	door->d_active_count--;
 	ds->ds_call = NULL;
 	call->dc_server_td = NULL;
@@ -2687,6 +2913,7 @@ door_server_requeue_undelivered_locked(
 	}
 
 	TAILQ_INSERT_HEAD(&door->d_pending, call, dc_link);
+	door_call_id_insert_locked(door, call);
 	door->d_pending_count++;
 
 	if (call->dc_type == DOOR_CALL_RPC) {
@@ -2716,10 +2943,12 @@ door_return_async_locked(struct door *door, struct door_server_binding *ds,
     struct door_ioc_return *arg)
 {
 	struct door_async_batch batch;
+	struct door_fd_bundle fds;
 	struct door_call *call;
 	uint8_t *data;
 	size_t size;
 	int status;
+	bool descriptor_reply;
 
 	mtx_assert(&door->d_lock, MA_OWNED);
 	door_async_batch_init(&batch);
@@ -2728,11 +2957,22 @@ door_return_async_locked(struct door *door, struct door_server_binding *ds,
 	size = (size_t)arg->dir_reply_size;
 	status = 0;
 	data = NULL;
-	if (arg->dir_reply_desc_count != 0 || arg->dir_reply_fd >= 0)
+	bzero(&fds, sizeof(fds));
+	descriptor_reply = false;
+	if ((arg->dir_reply_desc_count != 0 || arg->dir_reply_fd >= 0) &&
+	    !call->dc_async_reply_desc)
 		status = ENOTSUP;
 	else if (size > DOOR_ASYNC_REPLY_MAX)
 		status = EMSGSIZE;
+	if (status == 0)
+		status = door_check_limits_locked(door, size,
+		    door_input_desc_count(arg->dir_reply_desc_count,
+		    arg->dir_reply_fd));
 	mtx_unlock(&door->d_lock);
+	if (status == 0 &&
+	    (arg->dir_reply_desc_count != 0 || arg->dir_reply_fd >= 0))
+		status = door_fd_bundle_capture(curthread, arg->dir_reply_desc_ptr,
+		    arg->dir_reply_desc_count, arg->dir_reply_fd, &fds);
 	if (status == 0 && size != 0) {
 		data = malloc(size, M_DOORFS, M_WAITOK);
 		if (copyin((const void *)(uintptr_t)arg->dir_reply_ptr,
@@ -2748,20 +2988,33 @@ door_return_async_locked(struct door *door, struct door_server_binding *ds,
 		mtx_unlock(&door->d_lock);
 		if (data != NULL)
 			free(data, M_DOORFS);
+		door_fd_bundle_drop(&fds, curthread);
 		door_call_drop(call);
 		return (EBADF);
 	}
 	if (call->dc_state == DOOR_CALL_ACTIVE) {
 		TAILQ_REMOVE(&door->d_active, call, dc_link);
+		door_call_id_remove_locked(door, call);
 		door->d_active_count--;
 		call->dc_state = DOOR_CALL_DONE;
 		call->dc_error = status;
+		if (status == 0 && fds.df_count != 0) {
+			call->dc_reply_fds = fds;
+			bzero(&fds, sizeof(fds));
+			call->dc_async_source = door;
+			door_hold(door);
+			TAILQ_INSERT_TAIL(&door->d_async_replies, call,
+			    dc_async_reply_link);
+			door_call_id_insert_locked(door, call);
+			descriptor_reply = true;
+		}
 		door_async_schedule_locked(door, call, status,
 		    data, status == 0 ? size : 0, &batch);
 		data = NULL;
 	}
 	if (call->dc_state == DOOR_CALL_CANCELLED) {
 		TAILQ_REMOVE(&door->d_active, call, dc_link);
+		door_call_id_remove_locked(door, call);
 		door->d_active_count--;
 	}
 	ds->ds_call = NULL;
@@ -2772,6 +3025,23 @@ door_return_async_locked(struct door *door, struct door_server_binding *ds,
 	door_return_clear_request(arg);
 	mtx_unlock(&door->d_lock);
 	door_async_batch_flush(&batch);
+	if (descriptor_reply) {
+		mtx_lock(&door->d_lock);
+		while (!call->dc_reply_install_done)
+			cv_wait(&call->dc_cv, &door->d_lock);
+		status = call->dc_reply_install_error;
+		mtx_unlock(&door->d_lock);
+		if (status == 0)
+			door_fd_bundle_move_sources(curthread, door, call,
+			    &call->dc_reply_fds);
+		mtx_lock(&door->d_lock);
+		TAILQ_REMOVE(&door->d_async_replies, call, dc_async_reply_link);
+		door_call_id_remove_locked(door, call);
+		call->dc_reply_move_done = true;
+		cv_broadcast(&call->dc_cv);
+		mtx_unlock(&door->d_lock);
+	}
+	door_fd_bundle_drop(&fds, curthread);
 	if (data != NULL)
 		free(data, M_DOORFS);
 	door_call_drop(call); /* server */
@@ -2911,6 +3181,7 @@ door_return(struct door *door, struct door_ioc_return *arg, struct thread *td,
 			if (call->dc_state == DOOR_CALL_ACTIVE ||
 			    call->dc_state == DOOR_CALL_CANCELLED) {
 				TAILQ_REMOVE(&door->d_active, call, dc_link);
+				door_call_id_remove_locked(door, call);
 				door->d_active_count--;
 			}
 			ds->ds_call = NULL;
@@ -3075,6 +3346,7 @@ door_return(struct door *door, struct door_ioc_return *arg, struct thread *td,
 		if (call->dc_state == DOOR_CALL_ACTIVE ||
 		    call->dc_state == DOOR_CALL_CANCELLED) {
 			TAILQ_REMOVE(&door->d_active, call, dc_link);
+			door_call_id_remove_locked(door, call);
 			door->d_active_count--;
 		}
 		ds->ds_call = NULL;
@@ -3148,6 +3420,7 @@ door_return(struct door *door, struct door_ioc_return *arg, struct thread *td,
 		if (call->dc_state == DOOR_CALL_ACTIVE ||
 		    call->dc_state == DOOR_CALL_CANCELLED) {
 			TAILQ_REMOVE(&door->d_active, call, dc_link);
+			door_call_id_remove_locked(door, call);
 			door->d_active_count--;
 		}
 		ds->ds_call = NULL;
@@ -3352,6 +3625,7 @@ next_request:
 		call = TAILQ_FIRST(&door->d_pending);
 		KASSERT(call != NULL, ("worker woke without assigned call"));
 		TAILQ_REMOVE(&door->d_pending, call, dc_link);
+		door_call_id_remove_locked(door, call);
 		door->d_pending_count--;
 		door_call_activate_locked(door, call, ds);
 
@@ -3541,6 +3815,7 @@ door_thread_cleanup_binding(struct door_server_binding *ds, struct thread *td)
 		if (call->dc_state == DOOR_CALL_ACTIVE ||
 		    call->dc_state == DOOR_CALL_CANCELLED) {
 			TAILQ_REMOVE(&door->d_active, call, dc_link);
+			door_call_id_remove_locked(door, call);
 			door->d_active_count--;
 		}
 		if (call->dc_state == DOOR_CALL_ACTIVE) {

@@ -12,24 +12,28 @@
 #include <sys/fcntl.h>
 #include <sys/proc.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <sys/user.h>
 
 #include <sys/door_impl.h>
 
+static fo_rdwr_t door_file_read;
+static fo_kqfilter_t door_file_kqfilter;
 static fo_stat_t door_file_stat;
 static fo_close_t door_file_close;
 static fo_fill_kinfo_t door_file_fill_kinfo;
 
+static fo_fork_t door_client_nopass_fork;
 static fo_close_t door_client_file_close;
 static fo_fill_kinfo_t door_client_file_fill_kinfo;
 
 static const struct fileops door_fileops = {
-    .fo_read = invfo_rdwr,
+    .fo_read = door_file_read,
     .fo_write = invfo_rdwr,
     .fo_truncate = invfo_truncate,
     .fo_ioctl = invfo_ioctl,
     .fo_poll = invfo_poll,
-    .fo_kqfilter = invfo_kqfilter,
+    .fo_kqfilter = door_file_kqfilter,
     .fo_stat = door_file_stat,
     .fo_close = door_file_close,
     .fo_chmod = invfo_chmod,
@@ -39,12 +43,12 @@ static const struct fileops door_fileops = {
     .fo_flags = DFLAG_PASSABLE,
 };
 static const struct fileops door_client_fileops = {
-    .fo_read = invfo_rdwr,
+    .fo_read = door_file_read,
     .fo_write = invfo_rdwr,
     .fo_truncate = invfo_truncate,
     .fo_ioctl = invfo_ioctl,
     .fo_poll = invfo_poll,
-    .fo_kqfilter = invfo_kqfilter,
+    .fo_kqfilter = door_file_kqfilter,
     .fo_stat = door_file_stat,
     .fo_close = door_client_file_close,
     .fo_chmod = invfo_chmod,
@@ -54,11 +58,115 @@ static const struct fileops door_client_fileops = {
     .fo_flags = DFLAG_PASSABLE,
 };
 
+/* Identical operations; delegation is denied by descriptor-transfer paths. */
+static const struct fileops door_client_nopass_fileops = {
+    .fo_read = door_file_read,
+    .fo_write = invfo_rdwr,
+    .fo_truncate = invfo_truncate,
+    .fo_ioctl = invfo_ioctl,
+    .fo_poll = invfo_poll,
+    .fo_kqfilter = door_file_kqfilter,
+    .fo_stat = door_file_stat,
+    .fo_close = door_client_file_close,
+    .fo_chmod = invfo_chmod,
+    .fo_chown = invfo_chown,
+    .fo_sendfile = invfo_sendfile,
+    .fo_fill_kinfo = door_client_file_fill_kinfo,
+    .fo_fork = door_client_nopass_fork,
+    .fo_flags = DFLAG_FORK,
+};
+
+/*
+ * fdcopy() uses PASSABLE as its default inheritance rule too. Keep fork
+ * inheritance without enabling SCM_RIGHTS/Doors transfer: share the same file,
+ * with one reference per inherited descriptor. The DFLAG_FORK second pass
+ * needs no fixups because neither the object nor its operations are cloned.
+ */
+static int
+door_client_nopass_fork(struct filedesc *fdp __unused, struct file *source,
+    struct file **result, struct proc *child __unused,
+    struct thread *td __unused)
+{
+
+	if (source == NULL)
+		return (0); /* fdcopy second pass */
+	if (!fhold(source))
+		return (EBADF);
+	*result = source;
+	return (0);
+}
+
+static int
+door_file_read(struct file *fp, struct uio *uio,
+    struct ucred *cred __unused, int flags __unused, struct thread *td)
+{
+	return (door_completion_read(fp->f_data, uio, td));
+}
+
+static void
+door_completion_detach(struct knote *kn)
+{
+	struct door *door;
+
+	door = kn->kn_hook;
+	knlist_remove(&door->d_completion_knlist, kn, 0);
+	door_drop(door);
+}
+
+static int
+door_completion_ready(struct knote *kn, long hint __unused)
+{
+	struct door *door;
+
+	door = kn->kn_hook;
+	mtx_assert(&door->d_lock, MA_OWNED);
+	kn->kn_data = door->d_pending_count;
+	if (door->d_revoked) {
+		kn->kn_flags |= EV_EOF;
+		return (1);
+	}
+
+	return (door->d_pending_count != 0);
+}
+
+static struct filterops door_completion_filter = {
+	.f_isfd = 1,
+	.f_detach = door_completion_detach,
+	.f_event = door_completion_ready,
+};
+
+static int
+door_file_kqfilter(struct file *fp, struct knote *kn)
+{
+	struct door *door;
+	int error;
+
+	if (kn->kn_filter != EVFILT_READ)
+		return (EINVAL);
+
+	door = fp->f_data;
+	error = door_owner_lock(door, curthread->td_proc);
+	if (error != 0)
+		return (error);
+	if (!door->d_completion_manual) {
+		mtx_unlock(&door->d_lock);
+		return (EINVAL);
+	}
+
+	door_hold(door);
+	kn->kn_hook = door;
+	kn->kn_fop = &door_completion_filter;
+	knlist_add(&door->d_completion_knlist, kn, 1);
+	mtx_unlock(&door->d_lock);
+	return (0);
+}
+
 bool
 door_file_is_door(const struct file *fp)
 {
 	return (fp->f_type == DTYPE_DOOR &&
-	    (fp->f_ops == &door_fileops || fp->f_ops == &door_client_fileops));
+	    (fp->f_ops == &door_fileops || fp->f_ops == &door_client_fileops ||
+	    fp->f_ops == &door_client_nopass_fileops));
 }
 
 bool
@@ -166,7 +274,8 @@ door_client_file_fill_kinfo(
 }
 
 int
-door_client_file_install(struct thread *td, struct door *door, int *fdp)
+door_client_file_install_policy(struct thread *td, struct door *door,
+    bool passable, int *fdp)
 {
 	struct file *fp;
 	int error, fd;
@@ -182,10 +291,18 @@ door_client_file_install(struct thread *td, struct door *door, int *fdp)
 	}
 
 	door_hold(door);
-	finit(fp, FREAD | FWRITE, DTYPE_DOOR, door, &door_client_fileops);
+	finit(fp, FREAD | FWRITE, DTYPE_DOOR, door,
+	    passable ? &door_client_fileops : &door_client_nopass_fileops);
 	fdrop(fp, td);
 	*fdp = fd;
 	return (0);
+}
+
+int
+door_client_file_install(struct thread *td, struct door *door, int *fdp)
+{
+
+	return (door_client_file_install_policy(td, door, true, fdp));
 }
 
 /*
@@ -215,7 +332,10 @@ door_file_clone(struct file *source, struct file *destination, int flags,
 		return (error);
 
 	door_hold(door);
-	finit(destination, flags, DTYPE_DOOR, door, &door_client_fileops);
+	/* A pathname clone must not restore delegation denied by its source. */
+	finit(destination, flags, DTYPE_DOOR, door,
+	    (source->f_ops->fo_flags & DFLAG_PASSABLE) != 0 ?
+	    &door_client_fileops : &door_client_nopass_fileops);
 	return (0);
 }
 

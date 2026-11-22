@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -45,14 +46,17 @@ door_named_copy_name(char dst[DOOR_NAME_MAX], const char *name)
 }
 
 static int
-door_named_flags(uint_t flags)
+door_named_flags(uint_t flags, bool registration)
 {
-    if ((flags & ~DOOR_NAMED_GLOBAL) != 0) {
+    uint_t allowed;
+
+    allowed = registration ? DOOR_NAMED_F_REGISTER_MASK : DOOR_NAMED_GLOBAL;
+    if ((flags & ~allowed) != 0) {
         errno = EINVAL;
         return (-1);
     }
 
-    return ((flags & DOOR_NAMED_GLOBAL) != 0 ? DOOR_NAMED_F_GLOBAL : 0);
+    return ((int)flags);
 }
 
 /* A successful ioctl still reports failure if its control fd cannot close. */
@@ -85,7 +89,7 @@ door_named_register(int door_fd, const char *name, uint_t flags)
         return (-1);
     }
 
-    kflags = door_named_flags(flags);
+    kflags = door_named_flags(flags, true);
     if (kflags == -1)
         return (-1);
 
@@ -110,7 +114,7 @@ door_named_unregister(int door_fd, const char *name, uint_t flags)
         return (-1);
     }
 
-    kflags = door_named_flags(flags);
+    kflags = door_named_flags(flags, false);
     if (kflags == -1)
         return (-1);
 

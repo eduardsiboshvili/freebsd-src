@@ -13,6 +13,7 @@
 #include <sys/types.h>
 #include <sys/condvar.h>
 #include <sys/file.h>
+#include <sys/event.h>
 #include <sys/malloc.h>
 #include <sys/mutex.h>
 #include <sys/proc.h>
@@ -99,6 +100,8 @@ enum door_call_type {
 
 struct door_call {
 	TAILQ_ENTRY(door_call) dc_link;
+	LIST_ENTRY(door_call) dc_id_link;
+	struct door *dc_id_owner; /* indexed queue membership; protected by d_lock */
 	struct cv dc_cv;
 	u_int dc_refs;
 	enum door_call_state dc_state;
@@ -144,6 +147,11 @@ struct door_call {
 	bool dc_async;
 	bool dc_async_scheduled; /* protected by the request Door's d_lock */
 	bool dc_async_reserved;
+	bool dc_async_reply_desc;
+	bool dc_async_receiving; /* protected by dc_async_source->d_lock */
+	TAILQ_ENTRY(door_call) dc_async_reply_link;
+	struct door *dc_async_source; /* held while descriptor reply exists */
+	struct door_call *dc_async_origin; /* notification holds origin */
 	struct door *dc_async_target; /* held through completion task */
 	struct task dc_async_task;
 	struct door_call *dc_async_enqueue_next; /* temporary post-unlock batch */
@@ -189,11 +197,17 @@ struct door_server_binding {
 };
 
 TAILQ_HEAD(door_call_head, door_call);
+LIST_HEAD(door_call_id_head, door_call);
+#define DOOR_CALL_ID_BUCKETS 256
 LIST_HEAD(door_server_head, door_server_binding);
 TAILQ_HEAD(door_shm_region_head, door_shm_region);
 
 struct door {
 	struct mtx d_lock;
+	struct knlist d_completion_knlist;
+	struct door_call *d_completion_held;
+	bool d_completion_manual;
+	bool d_completion_reading;
 	u_int d_refs;
 	u_int d_file_count;
 	uint64_t d_unref_generation;
@@ -243,8 +257,11 @@ struct door {
 #define DOOR_HOT_REVOKED 0x00000001u
 #define DOOR_HOT_CUSTOM_LIMITS 0x00000002u
 
+	/* Index of pending, active and descriptor-held replies; d_lock. */
+	struct door_call_id_head d_call_ids[DOOR_CALL_ID_BUCKETS];
 	struct door_call_head d_pending;
 	struct door_call_head d_active;
+	struct door_call_head d_async_replies; /* server-owned descriptor replies */
 	struct door_server_head d_servers;
 	struct door_shm_region_head d_shm_regions;
 	uint64_t d_next_shm_region;
@@ -281,6 +298,9 @@ int kern_door(struct thread *, long, long, long, long, long, long);
 int door_rpc_cache_init(void);
 void door_rpc_cache_fini(void);
 bool door_rpc_calls_busy(void);
+struct uio;
+int door_completion_read(struct door *, struct uio *, struct thread *);
+
 int door_alloc(struct proc *, uint64_t, uint32_t, uint32_t, struct door **);
 void door_hold(struct door *);
 void door_drop(struct door *);
@@ -299,6 +319,8 @@ void door_maybe_orphan(struct door *);
 void door_owner_snapshot(struct door *, struct proc *, pid_t *, bool *);
 void door_unref_enqueue(struct door *, uint64_t);
 void door_unref_drop(struct door_call *);
+void door_call_id_insert_locked(struct door *, struct door_call *);
+void door_call_id_remove_locked(struct door *, struct door_call *);
 void door_oneway_drop(struct door_call *);
 void door_oneway_server_drop(struct door_call *);
 void door_call_wake_client_locked(struct door_call *, int);
@@ -335,6 +357,8 @@ int door_call_full(struct door *, struct door_ioc_call *, struct thread *);
 int door_async_call(struct door *, struct door *,
     const struct door_ioc_async_call *, struct thread *);
 int door_async_cancel(struct door *, struct door *, uint64_t);
+int door_async_recv_desc(struct door *, struct door *,
+    const struct door_ioc_async_recv_desc *, struct thread *, uint32_t *);
 /*
  * Collect under the request Door's d_lock; flush after unlocking, before
  * releasing any caller-owned call references.  Each queued call has its own
@@ -380,6 +404,7 @@ int door_server_worker_exit_bound(struct thread *);
 int door_server_cred_bound(struct thread *, struct door_ioc_cred *);
 
 int door_client_file_install(struct thread *, struct door *, int *);
+int door_client_file_install_policy(struct thread *, struct door *, bool, int *);
 bool door_file_is_door(const struct file *);
 bool door_file_is_live(const struct file *);
 int door_file_clone(struct file *, struct file *, int, struct ucred *);

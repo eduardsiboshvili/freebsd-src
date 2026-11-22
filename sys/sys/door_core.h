@@ -66,6 +66,8 @@ struct door_kdesc {
 
 #define DOOR_CREATE_F_NORMAL 0x00000001U
 #define DOOR_CREATE_F_XCREATE 0x00000002U
+/* Owner-drained native completion queue: no server binding or worker. */
+#define DOOR_CREATE_F_COMPLETION 0x00000004U
 
 /* One six-register native syscall: one selector and five operands. */
 #define DOOR_SC_CALL 1U
@@ -102,6 +104,7 @@ struct door_kdesc {
 #define DOOR_SC_SHM_VIEW_DESTROY 31U
 #define DOOR_SC_SHM_PAIR_WAIT 32U
 #define DOOR_SC_SHM_PAIR_WAKE 33U
+#define DOOR_SC_ASYNC_RECV_DESC 34U
 
 /* Two independent event words, in separate cache lines of the first page. */
 #define DOOR_SHM_PAIR_LANES 2U
@@ -147,10 +150,25 @@ struct door_ioc_shm_view_segment {
 };
 
 
-/* A data-only RPC.  The reply is delivered as a request to completion_fd. */
+/* Requests are data-only; descriptor replies require explicit opt-in. */
+#define DOOR_ASYNC_DESC_MAX 1024U
+#define DOOR_ASYNC_F_REPLY_DESC 0x00000001U
+#define DOOR_ASYNC_F_MASK DOOR_ASYNC_F_REPLY_DESC
+
+/* Fixed-width layout is shared by native and compat32 callers. */
+struct door_ioc_async_recv_desc {
+	uint32_t diard_version;
+	uint32_t diard_capacity;
+	uint64_t diard_call_id;
+	uint64_t diard_desc_ptr;
+	int32_t diard_completion_fd;
+	uint32_t diard_reserved;
+};
+
+/* The reply notification is delivered to completion_fd. */
 struct door_ioc_async_call {
 	uint32_t diac_version;
-	uint32_t diac_flags; /* must be zero */
+	uint32_t diac_flags; /* DOOR_ASYNC_F_* */
 	uint64_t diac_call_id; /* nonzero, chosen before submission */
 	uint64_t diac_request_ptr;
 	uint64_t diac_request_size;
@@ -169,7 +187,8 @@ struct door_ioc_async_cancel {
 #define DOOR_ASYNC_C_REVOKED 0x00000001U
 #define DOOR_ASYNC_C_WORKER_EXIT 0x00000002U
 #define DOOR_ASYNC_C_CANCELLED 0x00000004U
-#define DOOR_ASYNC_C_FLAG_MASK 0x00000007U
+#define DOOR_ASYNC_C_REPLY_DESC 0x00000008U
+#define DOOR_ASYNC_C_FLAG_MASK 0x0000000fU
 
 /* The request body delivered to the completion Door follows this header. */
 struct door_async_completion {
@@ -427,6 +446,10 @@ struct door_sys_fast_return_io {
 #define DOOR_NAME_MAX 128
 
 #define DOOR_NAMED_F_GLOBAL 0x00000001U
+#define DOOR_NAMED_F_NO_PASS 0x00000002U
+#define DOOR_NAMED_F_CONNECT_ONCE 0x00000004U
+#define DOOR_NAMED_F_REGISTER_MASK \
+    (DOOR_NAMED_F_GLOBAL | DOOR_NAMED_F_NO_PASS | DOOR_NAMED_F_CONNECT_ONCE)
 
 struct door_ctl_register {
 	uint32_t dcr_version;

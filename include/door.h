@@ -225,6 +225,9 @@ typedef struct door_shm_ring_view {
  * capability fd pinned to the generation current at connect time.
  */
 #define DOOR_NAMED_GLOBAL      0x00000001U
+/* Registration policies apply only to capabilities issued by named CONNECT. */
+#define DOOR_NAMED_NO_PASS     0x00000002U
+#define DOOR_NAMED_CONNECT_ONCE 0x00000004U
 
 typedef struct door_named_info {
     int32_t dni_target_jid;
@@ -297,8 +300,9 @@ int door_oneway(int, const void *, size_t);
 
 /*
  * Ordinary Doors use kernel ASYNC_CALL and normal server callbacks/RETURN;
- * legacy DOOR_ONEWAY uses the registered reply protocol. Replies are data-only,
- * up to 64 KiB. Received completions run on reply workers; close drains remaining
+ * legacy DOOR_ONEWAY uses the registered reply protocol. The original callback
+ * API has data-only replies; door_async_submit_desc opts into native fd replies,
+ * up to 64 KiB. Callback-mode completions run on a fixed reply worker; close drains remaining
  * records with ECANCELED on the closing thread. Thread-affine runtimes must
  * marshal both cases. Completion bytes are borrowed only for the callback.
  * Close drains the reply endpoint, not callbacks executing at the peer.
@@ -315,7 +319,29 @@ typedef struct door_async_request {
 } door_async_request_t;
 typedef void door_async_completion_t(uint64_t, int, const void *, size_t,
     void *);
+/*
+ * Native async descriptor replies. The descriptor array and data are borrowed
+ * for this callback; each received fd belongs to the application, which must
+ * retain or close it. Descriptor collection and MOVE acknowledgement complete
+ * before user code runs. The original server may wait in door_return() until
+ * collection; the submitting thread never waits for that reply.
+ */
+typedef void door_async_completion_desc_t(uint64_t, int, const void *, size_t,
+    door_desc_t *, uint_t, void *);
+int door_async_submit_desc(door_async_t *, const void *, size_t,
+    door_async_completion_desc_t *, void *, uint64_t *);
 int door_async_open(int, size_t, door_async_t **);
+/*
+ * Native event-loop mode: no completion threads. Register the borrowed poll fd
+ * with kqueue EVFILT_READ and call dispatch on that same existing application
+ * thread. Dispatch never waits for data, but user callbacks/descriptor MOVE
+ * acknowledgement may block. One dispatcher per context; recursion is EBUSY.
+ * fd is owned by ctx: do not close, read or revoke it directly. Close drains
+ * remaining callbacks with ECANCELED on the closing thread, as in callback mode.
+ */
+int door_async_open_poll(int, size_t, door_async_t **);
+int door_async_poll_fd(const door_async_t *);
+int door_async_dispatch(door_async_t *, unsigned int);
 int door_async_reply_fd(const door_async_t *);
 int door_async_token(const door_async_t *, uint64_t *);
 int door_async_submit(door_async_t *, const void *, size_t,

@@ -66,6 +66,16 @@ DOOR_ABI_OFFSET(struct door_ioc_async_call, diac_request_size, 24);
 DOOR_ABI_OFFSET(struct door_ioc_async_call, diac_completion_fd, 32);
 DOOR_ABI_OFFSET(struct door_ioc_async_call, diac_reserved, 36);
 
+/* Async descriptor collection has the same layout in both data models. */
+DOOR_ABI_SIZE(struct door_ioc_async_recv_desc, 32);
+DOOR_ABI_ALIGN(struct door_ioc_async_recv_desc, DOOR_ABI_NATIVE(8, 4));
+DOOR_ABI_OFFSET(struct door_ioc_async_recv_desc, diard_version, 0);
+DOOR_ABI_OFFSET(struct door_ioc_async_recv_desc, diard_capacity, 4);
+DOOR_ABI_OFFSET(struct door_ioc_async_recv_desc, diard_call_id, 8);
+DOOR_ABI_OFFSET(struct door_ioc_async_recv_desc, diard_desc_ptr, 16);
+DOOR_ABI_OFFSET(struct door_ioc_async_recv_desc, diard_completion_fd, 24);
+DOOR_ABI_OFFSET(struct door_ioc_async_recv_desc, diard_reserved, 28);
+
 /* Full-width cancel is a fixed wire record, including on i386. */
 DOOR_ABI_SIZE(door_shm_view_t, DOOR_ABI_NATIVE(48, 36));
 DOOR_ABI_ALIGN(door_shm_view_t, DOOR_ABI_NATIVE(8, 4));

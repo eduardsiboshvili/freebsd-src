@@ -1,4 +1,5 @@
-ATF_TESTS_C= async_test async_kernel_limits_test
+ATF_TESTS_C= async_test async_kernel_limits_test \
+    async_descriptor_test async_poll_test async_id_index_test
 
 .if defined(WITH_DOOR_TESTS) && ${WITH_DOOR_TESTS} == "yes"
 CFLAGS+= -DDOOR_TESTS -I${SRCTOP}/sys

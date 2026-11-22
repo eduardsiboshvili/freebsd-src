@@ -846,7 +846,8 @@ door_sys_async_call(struct thread *td, long value, unsigned long uptr)
 	if (error != 0) {
 		return (error);
 	}
-	if (arg.diac_version != DOOR_ABI_VERSION || arg.diac_flags != 0 ||
+	if (arg.diac_version != DOOR_ABI_VERSION ||
+	    (arg.diac_flags & ~DOOR_ASYNC_F_MASK) != 0 ||
 	    arg.diac_reserved != 0 || arg.diac_call_id == 0) {
 		return (EINVAL);
 	}
@@ -876,6 +877,49 @@ door_sys_async_call(struct thread *td, long value, unsigned long uptr)
 	}
 	door_sys_leave(td, fp, stop_prev);
 
+	return (error);
+}
+
+static int
+door_sys_async_recv_desc(struct thread *td, long value, unsigned long uptr)
+{
+	struct door_ioc_async_recv_desc arg;
+	struct door *door, *target;
+	struct file *fp, *target_fp;
+	uint32_t count;
+	int error, fd, stop_prev;
+
+	error = door_sys_decode_fd(value, &fd);
+	if (error != 0)
+		return (error);
+	error = door_sys_copyin(td, (void *)(uintptr_t)uptr, &arg, sizeof(arg));
+	if (error != 0)
+		return (error);
+	if (arg.diard_version != DOOR_ABI_VERSION || arg.diard_reserved != 0 ||
+	    arg.diard_call_id == 0 || arg.diard_capacity == 0 ||
+	    arg.diard_capacity > DOOR_MAX_DESC || arg.diard_desc_ptr == 0)
+		return (EINVAL);
+	error = door_sys_range(td, arg.diard_desc_ptr,
+	    (uint64_t)arg.diard_capacity * sizeof(struct door_kdesc));
+	if (error != 0)
+		return (error);
+	/* A published descriptor transfer must finish or roll back atomically. */
+	error = door_sys_enter(td, fd, &door_call_rights, false,
+	    SIGDEFERSTOP_SILENT, &fp, &door, &stop_prev);
+	if (error != 0)
+		return (error);
+	error = door_file_get_ref(td, arg.diard_completion_fd,
+	    &door_service_rights, &target_fp, &target);
+	if (error == 0) {
+		if (!door_is_owner(target, td->td_proc))
+			error = EPERM;
+		else
+			error = door_async_recv_desc(door, target, &arg, td, &count);
+		fdrop(target_fp, td);
+	}
+	if (error == 0)
+		td->td_retval[0] = count;
+	door_sys_leave(td, fp, stop_prev);
 	return (error);
 }
 
@@ -1055,6 +1099,8 @@ kern_door(struct thread *td, long op, long arg1, long arg2, long arg3,
 		    td, arg1, arg2, arg3, arg4, arg5));
 	case DOOR_SC_ONEWAY:
 		return (door_sys_oneway(td, arg1, arg2, arg3));
+	case DOOR_SC_ASYNC_RECV_DESC:
+		return (door_sys_async_recv_desc(td, arg1, arg2));
 	case DOOR_SC_ASYNC_CALL:
 		return (door_sys_async_call(td, arg1, arg2));
 	case DOOR_SC_ASYNC_CANCEL:

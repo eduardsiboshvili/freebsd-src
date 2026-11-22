@@ -21,9 +21,17 @@ Doors Library (libdoor, -ldoor)
 .Ft int
 .Fn door_async_open "int request_fd" "size_t max_pending" "door_async_t **context"
 .Ft int
+.Fn door_async_open_poll "int request_fd" "size_t max_pending" "door_async_t **context"
+.Ft int
+.Fn door_async_poll_fd "const door_async_t *context"
+.Ft int
+.Fn door_async_dispatch "door_async_t *context" "unsigned int budget"
+.Ft int
 .Fn door_async_reply_fd "const door_async_t *context"
 .Ft int
 .Fn door_async_submit "door_async_t *context" "const void *data" "size_t size" "door_async_completion_t *completion" "void *cookie" "uint64_t *id"
+.Ft int
+.Fn door_async_submit_desc "door_async_t *context" "const void *data" "size_t size" "door_async_completion_desc_t *completion" "void *cookie" "uint64_t *id"
 .Pp
 .Fn door_async_cancel "door_async_t *context" "uint64_t id"
 .Ft int
@@ -129,6 +137,45 @@ occur later.
 creates a private completion endpoint for an ordinary Door or a preconnected
 .Dv DOOR_ONEWAY
 endpoint.
+.Ss Caller-dispatched completions
+.Fn door_async_open_poll
+is the native event-loop alternative to
+.Fn door_async_open .
+It creates no completion worker threads and accepts only ordinary request Doors.
+Register the borrowed descriptor returned by
+.Fn door_async_poll_fd
+with kqueue
+.Dv EVFILT_READ .
+.Fn door_async_dispatch
+processes at most
+.Fa budget
+ready notifications and invokes the existing submission callbacks on its caller.
+It returns the number of processed notifications, zero if none are ready, or
+minus one with errno on an error before any notification was processed.
+A zero budget is invalid; recursive or concurrent dispatch on one context gives
+.Er EBUSY .
+Drain ready work before waiting again; bounded dispatch re-signals remaining
+records for edge-cleared kqueue registrations.
+.Pp
+The receive step does not wait for a message, but user callbacks and the
+transactional descriptor-install acknowledgement may block.
+Callback result bytes are borrowed until that callback returns.
+Do not close, read, revoke, or modify the borrowed fd directly.
+The kernel uses framed nonblocking reads internally; short buffers return
+.Er EMSGSIZE
+and a failed copy does not dequeue the notification.
+Only the creating process may read or register the endpoint, including after fork.
+Revocation wakes registered kqueues with
+.Dv EV_EOF .
+No application server binding is installed on the dispatching thread.
+.Pp
+.Fn door_async_close
+waits for an active dispatcher and callback before releasing context storage.
+It remains invalid from a callback executing on that context.
+As with callback mode, undispatched requests are drained locally with
+.Er ECANCELED
+on the closing thread.
+The legacy DOOR_ONEWAY token protocol is not supported by open_poll.
 .Ss Kernel-routed asynchronous calls
 On an ordinary Door,
 .Fn door_async_submit
@@ -158,6 +205,38 @@ as applicable.
 uses the request and caller-owned completion capabilities to select
 .Er ECANCELED
 if cancellation wins. It does not stop an already running server callback.
+.Ss Asynchronous descriptor replies
+.Fn door_async_submit_desc
+opts a native asynchronous request into descriptor-bearing replies.
+It is not supported by the legacy ONEWAY protocol.
+The callback has arguments
+.Va id , status , data , size , descriptors , count , cookie .
+Data and the descriptor array are borrowed until callback return.
+Each received descriptor belongs to the application, which must retain or close
+it; the library does not close descriptors handed to this callback.
+An error callback receives no data or descriptors.
+.Pp
+The server uses the ordinary
+.Fn door_return
+interface, including COPY and
+.Dv DOOR_RELEASE
+semantics. The kernel retains descriptor references and Capsicum rights until
+receipt or discard. The completion notification contains no raw descriptor
+numbers: libdoor collects them with
+.Dv DOOR_SC_ASYNC_RECV_DESC
+in the receiving process. This uses the synchronous descriptor installer and
+its rollback on installation or copyout failure.
+.Pp
+A descriptor-bearing RETURN may wait for collection. Successful installation
+commits MOVE; the server removes matching source descriptors before collection
+returns and before the user completion callback executes. Failure preserves
+MOVE sources. Discarding the notification releases an unclaimed transfer.
+A stalled receiver can occupy a server worker, as with synchronous delivery.
+Cancellation cannot undo an already published terminal reply or committed MOVE.
+Existing
+.Fn door_async_submit
+calls remain data-only and reject descriptor replies with
+.Er ENOTSUP .
 .Ss Legacy ONEWAY request protocol
 For a
 .Dv DOOR_ONEWAY
@@ -197,7 +276,8 @@ at the context's
 .Fa max_pending
 limit or the additional process-wide libdoor limit of 4096 pending requests.
 Kernel admission limits are separate.
-Received completions run on private reply workers; stale/duplicate replies
+In compatibility callback mode, received completions run on one fixed private
+reply worker per context; stale/duplicate replies
 are ignored. Bytes passed to a completion callback are borrowed only for its
 invocation.
 .Fn door_async_close
@@ -205,7 +285,9 @@ stops submissions, revokes the reply endpoint and drains its managed workers.
 It invokes remaining pending callbacks synchronously on the closing thread
 with
 .Er ECANCELED .
-Thread-affine runtimes must dispatch callbacks from either thread context.
+Compatibility-mode runtimes must account for callbacks on either the worker or
+closing thread. Event-loop contexts dispatch ordinary completions on the caller
+and close-drain callbacks on the closing thread.
 Close is not a barrier for callbacks running at the request peer.
 Call it outside a completion callback, after stopping other context and
 borrowed-reply-fd users. Arrange peer-death detection and retire contexts when
@@ -585,6 +667,24 @@ sets dni_attributes to zero; lookup returns attributes.
 Connect returns an ordinary descriptor pinned to the generation current at
 that instant.
 Unregistering a name does not invalidate capabilities already issued.
+.Pp
+Registration also accepts
+.Dv DOOR_NAMED_NO_PASS
+and
+.Dv DOOR_NAMED_CONNECT_ONCE ,
+individually or combined with the scope flag.
+NO_PASS issues client files without DFLAG_PASSABLE: Unix SCM_RIGHTS and Door
+COPY/MOVE transfer reject them. Duplication, fork inheritance and ordinary calls
+remain permitted; namefs clones retain the restriction.
+CONNECT_ONCE permits at most one client-file installation per registration.
+Concurrent or later connects return EACCES after the slot is claimed.
+Failures before installation return the slot; closing the issued fd does not.
+Installation commits issuance even if the ioctl result cannot later be copied
+back to userspace. Lookup does not consume the slot.
+Unregister or replacement creates a separate policy lifetime for subsequent
+registration and does not modify previously issued files.
+These rules apply to named CONNECT only, not all access to the underlying Door.
+Unregister accepts only scope flags; lookup/connect still require flags zero.
 .Ss Worker factories
 .Ft door_server_func_t *
 .Fn door_server_create "door_server_func_t *factory"

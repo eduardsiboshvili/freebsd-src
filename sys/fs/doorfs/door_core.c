@@ -114,13 +114,20 @@ door_destroy(struct door *door)
 	TAILQ_REMOVE(&door_all, door, d_all_link);
 	door->d_all_linked = false;
 	mtx_unlock(&door_list_lock);
+	KASSERT(door->d_completion_held == NULL && !door->d_completion_reading,
+	    ("destroying live manual completion read"));
 	KASSERT(door->d_async_reserved == 0,
 	    ("destroying door with async reservations"));
 	KASSERT(door->d_publications == 0, ("destroying published door"));
 	KASSERT(
 	    door->d_client_count == 0, ("destroying door with open clients"));
+	for (u_int i = 0; i < DOOR_CALL_ID_BUCKETS; i++)
+		KASSERT(LIST_EMPTY(&door->d_call_ids[i]),
+		    ("destroying door with indexed calls"));
 	KASSERT(TAILQ_EMPTY(&door->d_pending),
 	    ("destroying door with pending calls"));
+	KASSERT(TAILQ_EMPTY(&door->d_async_replies),
+	    ("destroying door with descriptor replies"));
 	KASSERT(TAILQ_EMPTY(&door->d_active),
 	    ("destroying door with active calls"));
 	KASSERT(LIST_EMPTY(&door->d_servers),
@@ -141,6 +148,7 @@ door_destroy(struct door *door)
 		crfree(door->d_owner_cred);
 		door->d_owner_cred = NULL;
 	}
+	knlist_destroy(&door->d_completion_knlist);
 	mtx_destroy(&door->d_lock);
 #ifdef DOORFS_TEST
 	door_test_object_drop(DOOR_TEST_OBJ_DOOR);
@@ -160,7 +168,7 @@ door_alloc(struct proc *owner, uint64_t cookie, uint32_t attributes,
     uint32_t flags, struct door **doorp)
 {
 	struct door *door, *iter;
-	u_int owned;
+	u_int owned, i;
 	int error;
 
 	*doorp = NULL;
@@ -179,6 +187,10 @@ door_alloc(struct proc *owner, uint64_t cookie, uint32_t attributes,
 		if ((attributes & DOOR_PRIVATE) == 0)
 			return (EINVAL);
 		attributes |= DOOR_PRIVCREATE;
+	} else if (flags == DOOR_CREATE_F_COMPLETION) {
+		if (attributes != (DOOR_ONEWAY | DOOR_PRIVATE |
+		    DOOR_NO_DEPLETION_CB))
+			return (EINVAL);
 	} else if (flags != DOOR_CREATE_F_NORMAL) {
 		return (EINVAL);
 	}
@@ -197,8 +209,13 @@ door_alloc(struct proc *owner, uint64_t cookie, uint32_t attributes,
 	door_test_object_add(DOOR_TEST_OBJ_DOOR);
 #endif
 	mtx_init(&door->d_lock, "door", NULL, MTX_DEF);
+	knlist_init_mtx(&door->d_completion_knlist, &door->d_lock);
+	door->d_completion_manual = flags == DOOR_CREATE_F_COMPLETION;
+	for (i = 0; i < DOOR_CALL_ID_BUCKETS; i++)
+		LIST_INIT(&door->d_call_ids[i]);
 	TAILQ_INIT(&door->d_pending);
 	TAILQ_INIT(&door->d_active);
+	TAILQ_INIT(&door->d_async_replies);
 	LIST_INIT(&door->d_servers);
 	TAILQ_INIT(&door->d_shm_regions);
 	door->d_next_call_id = 1;
@@ -233,6 +250,7 @@ door_alloc(struct proc *owner, uint64_t cookie, uint32_t attributes,
 		PROC_UNLOCK(owner);
 		crfree(door->d_owner_cred);
 		door->d_owner_cred = NULL;
+		knlist_destroy(&door->d_completion_knlist);
 		mtx_destroy(&door->d_lock);
 #ifdef DOORFS_TEST
 		door_test_object_drop(DOOR_TEST_OBJ_DOOR);
@@ -250,6 +268,7 @@ door_alloc(struct proc *owner, uint64_t cookie, uint32_t attributes,
 		PROC_UNLOCK(owner);
 		crfree(door->d_owner_cred);
 		door->d_owner_cred = NULL;
+		knlist_destroy(&door->d_completion_knlist);
 		mtx_destroy(&door->d_lock);
 #ifdef DOORFS_TEST
 		door_test_object_drop(DOOR_TEST_OBJ_DOOR);
@@ -517,11 +536,16 @@ door_revoke(struct door *door)
 		return (EBADF);
 	}
 	door->d_revoked = true;
+	if (door->d_completion_held != NULL) {
+		TAILQ_INSERT_TAIL(&dropped_async, door->d_completion_held, dc_link);
+		door->d_completion_held = NULL;
+	}
 	atomic_set_int(&door->d_hot_flags, DOOR_HOT_REVOKED);
 
 	TAILQ_FOREACH_SAFE(call, &door->d_pending, dc_link, tmp)
 	{
 		TAILQ_REMOVE(&door->d_pending, call, dc_link);
+		door_call_id_remove_locked(door, call);
 		door->d_pending_count--;
 		call->dc_error = EBADF;
 		call->dc_state = DOOR_CALL_REVOKED;
@@ -547,6 +571,7 @@ door_revoke(struct door *door)
 	TAILQ_FOREACH_SAFE(call, &door->d_active, dc_link, tmp)
 	{
 		TAILQ_REMOVE(&door->d_active, call, dc_link);
+		door_call_id_remove_locked(door, call);
 		door->d_active_count--;
 		call->dc_error = EBADF;
 		call->dc_state = DOOR_CALL_REVOKED;
@@ -591,6 +616,9 @@ door_revoke(struct door *door)
 			    call, DOOR_SHUTTLE_F_REPLY);
 		}
 	}
+
+	if (door->d_completion_manual)
+		KNOTE_LOCKED(&door->d_completion_knlist, 0);
 
 	/* Sleeping server threads remove their own local bindings on wakeup. */
 	LIST_FOREACH(ds, &door->d_servers, ds_link)
