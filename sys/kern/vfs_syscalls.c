@@ -1095,6 +1095,7 @@ sys_fchroot(struct thread *td, struct fchroot_args *uap)
 	int error;
 	uint8_t fdflags;
 
+	AUDIT_ARG_FD(uap->fd);
 	error = getvnode_path(td, uap->fd, &cap_fchroot_rights, &fdflags, &fp);
 	if (error != 0)
 		return (error);
@@ -1106,6 +1107,7 @@ sys_fchroot(struct thread *td, struct fchroot_args *uap)
 	vrefact(vp);
 	fdrop(fp, td);
 	vn_lock(vp, LK_SHARED | LK_RETRY);
+	AUDIT_ARG_VNODE1(vp);
 	error = kern_chroot(td, vp);
 	return (error);
 }
@@ -5435,7 +5437,8 @@ disable_altdir(struct thread *td)
 	if (error != 0)
 		return (error);
 #endif
-	return (pwd_altroot(td, NULL));
+	pwd_altroot_clear(td);
+	return (0);
 }
 
 static int
@@ -5489,6 +5492,8 @@ sys_fchaltroot(struct thread *td, struct fchaltroot_args *uap)
 	int error;
 	uint8_t fdflags;
 
+	AUDIT_ARG_FD(uap->fd);
+
 	error = chroot_check_priv(td);
 	if (error != 0)
 		return (error);
@@ -5507,5 +5512,6 @@ sys_fchaltroot(struct thread *td, struct fchaltroot_args *uap)
 	vrefact(vp);
 	fdrop(fp, td);
 	vn_lock(vp, LK_SHARED | LK_RETRY);
+	AUDIT_ARG_VNODE1(vp);
 	return (change_altdir(td, vp));
 }

@@ -829,7 +829,6 @@ kaudit_to_bsm(struct kaudit_record *kar, struct au_record **pau)
 	case AUE_CHALTROOT:
 	case AUE_CHDIR:
 	case AUE_CHROOT:
-	case AUE_FCHALTROOT:
 	case AUE_FSTATAT:
 	case AUE_FUTIMESAT:
 	case AUE_GETATTRLIST:
@@ -1045,7 +1044,9 @@ kaudit_to_bsm(struct kaudit_record *kar, struct au_record **pau)
 	/*
 	 * XXXRW: Some of these need to handle non-vnode cases as well.
 	 */
+	case AUE_FCHALTROOT:
 	case AUE_FCHDIR:
+	case AUE_FCHROOT:
 	case AUE_FPATHCONF:
 	case AUE_FSTAT:
 	case AUE_FSTATFS:
@@ -1444,6 +1445,22 @@ kaudit_to_bsm(struct kaudit_record *kar, struct au_record **pau)
 		}
 		if (ARG_IS_VALID(kar, ARG_VALUE)) {
 			tok = au_to_arg32(4, "data", ar->ar_arg_value);
+			kau_write(rec, tok);
+		}
+		PROCESS_PID_TOKENS(2);
+		break;
+
+	case AUE_PDPTRACE:
+		if (ARG_IS_VALID(kar, ARG_CMD)) {
+			tok = au_to_arg32(1, "request", ar->ar_arg_cmd);
+			kau_write(rec, tok);
+		}
+		if (ARG_IS_VALID(kar, ARG_FD)) {
+			tok = au_to_arg32(2, "fd", ar->ar_arg_fd);
+			kau_write(rec, tok);
+		}
+		if (ARG_IS_VALID(kar, ARG_VALUE)) {
+			tok = au_to_arg32(5, "data", ar->ar_arg_value);
 			kau_write(rec, tok);
 		}
 		PROCESS_PID_TOKENS(2);
